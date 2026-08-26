@@ -51,8 +51,10 @@ class AnthropicComposer:
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": json.dumps(user_payload)}],
         )
-        text = response.content[0].text
-        parsed = json.loads(text)
+        block = response.content[0]
+        if block.type != "text":
+            raise ValueError(f"expected a text block from the model, got {block.type}")
+        parsed = json.loads(block.text)
         return str(parsed["message"])
 
 
