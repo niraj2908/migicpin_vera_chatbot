@@ -55,6 +55,17 @@ from pathlib import Path
 from urllib import request as urlrequest, error as urlerror
 from abc import ABC, abstractmethod
 
+# =============================================================================
+# ENVIRONMENT OVERRIDES (added locally — never edit the CONFIGURATION section
+# above with a real key; export these instead so no secret is ever written to
+# this tracked file). Falls back to the hardcoded defaults above if unset —
+# behavior is unchanged when no env vars are present.
+# =============================================================================
+BOT_URL = os.environ.get("BOT_URL", BOT_URL)
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", LLM_PROVIDER)
+LLM_API_KEY = os.environ.get("LLM_API_KEY", LLM_API_KEY)
+LLM_MODEL = os.environ.get("LLM_MODEL", LLM_MODEL)
+
 # Constants
 TIMEOUT_LLM = 45
 DATASET_DIR = Path(__file__).parent / "dataset"
