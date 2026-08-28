@@ -57,7 +57,13 @@ def _parse_datetime(value: str) -> datetime:
         return datetime.now(UTC)
 
 
-@app.get("/v1/healthz")
+# Explicit GET+HEAD, not relying on any framework version's implicit HEAD-from-GET behavior
+# (checked directly: reproducible even locally with the currently pinned FastAPI/Starlette
+# versions that a HEAD request to a GET-only route returns 405). Free-tier uptime monitors
+# (e.g. UptimeRobot's free plan) send HEAD, not GET, and cannot be configured otherwise --
+# a 405 there is reported as the service being down, which is the actual root cause of a real
+# production incident, not a hypothetical one.
+@app.api_route("/v1/healthz", methods=["GET", "HEAD"])
 def healthz() -> dict[str, Any]:
     counts = store.context.counts()
     contexts_loaded = {

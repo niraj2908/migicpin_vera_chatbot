@@ -42,6 +42,31 @@ def test_healthz_starts_at_zero() -> None:
     assert body["contexts_loaded"] == {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
 
 
+def test_healthz_supports_head_with_no_body() -> None:
+    """Real production incident: free-tier uptime monitors (e.g. UptimeRobot's free plan) send
+    HEAD, not GET, with no way to change that -- a GET-only route answering 405 to HEAD gets
+    reported as the service being down. HEAD must return the same 200 a GET would, with no
+    response body (per HTTP semantics and to keep the fix itself minimal -- no monitor needs the
+    body, only the status)."""
+    resp = client.request("HEAD", "/v1/healthz")
+    assert resp.status_code == 200
+    assert resp.content == b""
+
+
+def test_healthz_head_does_not_change_get_behavior() -> None:
+    """The HEAD fix must not alter GET's own response in any way."""
+    get_resp = client.get("/v1/healthz")
+    head_resp = client.request("HEAD", "/v1/healthz")
+    assert get_resp.status_code == head_resp.status_code == 200
+    assert get_resp.headers.get("content-type") == head_resp.headers.get("content-type")
+
+
+def test_healthz_other_methods_still_rejected() -> None:
+    """The fix adds HEAD specifically, not an open door -- POST must still be rejected."""
+    resp = client.post("/v1/healthz")
+    assert resp.status_code == 405
+
+
 def test_metadata_has_required_fields() -> None:
     resp = client.get("/v1/metadata")
     assert resp.status_code == 200
