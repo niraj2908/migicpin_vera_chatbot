@@ -133,8 +133,17 @@ def test_golden_3_category_not_listed_as_relevant_does_not_send() -> None:
 def test_golden_4_official_seed_trigger_unmodified_is_too_far_out_to_send() -> None:
     """
     The seed dataset's own festival trigger, completely unmodified (188 days out, no timing
-    variation applied). A restaurant without an active offer at that distance should not be
-    messaged yet — this is the real official data, not a constructed case.
+    variation applied). Should not be messaged yet — this is the real official data, not a
+    constructed case.
+
+    P1 fix (hostile-audit finding): _festival_opportunity() now hard-gates on days_until being
+    inside TIMELINESS_WINDOW_DAYS, the same way renewal_due already hard-gates on days_remaining
+    — reusing that existing constant, not inventing a new one. Previously this generator still
+    returned a real (just low-scoring) Opportunity outside the window, which is what let a
+    concrete active offer alone push an arbitrarily distant festival over SEND_THRESHOLD (see the
+    now-corrected test below). Past the window the generator now returns None entirely, so
+    dominant_signal correctly falls back to "no_strong_opportunity" — the same outcome every
+    other hard-gated generator in this file already produces for out-of-scope evidence.
     """
     merchant = copy.deepcopy(_merchant_by_id("m_005_pizzajunction_restaurant_delhi"))
     merchant["offers"] = []
@@ -145,7 +154,7 @@ def test_golden_4_official_seed_trigger_unmodified_is_too_far_out_to_send() -> N
     decision, _body, _brief = _run(merchant, _restaurant_category(), trigger)
 
     assert decision.send is False
-    assert decision.dominant_signal == "festival:Diwali"  # the opportunity exists, just too weak
+    assert decision.dominant_signal == "no_strong_opportunity"
 
 
 def test_golden_5_suppression_blocks_a_repeat_send() -> None:
@@ -225,11 +234,16 @@ def test_golden_8_urgent_festival_single_clear_cta_no_invented_urgency() -> None
     assert engagement["no_generic_filler"], engagement
 
 
-def test_golden_9_weak_timing_but_offer_present_still_clears_threshold() -> None:
-    """Decision Quality: a festival just past the timeliness window (15 days out — outside the
-    14-day window the scorer treats as 'close') is a weak signal on its own, but a concrete
-    active offer is enough to still clear the send threshold, just with lower confidence than a
-    close festival with the same offer (golden_1's ~0.88 for reference)."""
+def test_golden_9_weak_timing_past_the_window_no_longer_clears_threshold_even_with_an_offer() -> None:
+    """P1 fix (hostile-audit finding), superseding this test's prior behavior: a festival just
+    past the timeliness window (15 days out — outside the 14-day window the scorer treats as
+    'close') used to still clear SEND_THRESHOLD on the strength of a concrete active offer alone.
+    On inspection that was the exact mechanism the audit's 188-day finding exploited — the
+    generator's out-of-window path had no upper bound, so an offer rescued a send at 15 days or
+    15 years away identically. There is no contract evidence for treating 15 days as
+    meaningfully different from 188 days (both are simply "outside the one evidenced close
+    window"), so the corrected behavior applies the same hard gate uniformly: outside
+    TIMELINESS_WINDOW_DAYS, no send, regardless of offer."""
     merchant = _merchant_by_id("m_005_pizzajunction_restaurant_delhi")
     trigger = copy.deepcopy(_festival_trigger_seed())
     trigger["id"] = "trg_golden_9"
@@ -238,9 +252,9 @@ def test_golden_9_weak_timing_but_offer_present_still_clears_threshold() -> None
 
     decision, body, _brief = _run(merchant, _restaurant_category(), trigger)
 
-    assert decision.send is True
-    assert decision.confidence < 0.65
-    assert body is not None
+    assert decision.send is False
+    assert decision.dominant_signal == "no_strong_opportunity"
+    assert body is None
 
 
 def test_golden_10_unrelated_merchant_signals_do_not_perturb_the_decision() -> None:

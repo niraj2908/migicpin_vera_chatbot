@@ -19,7 +19,7 @@ from vera.decision.compiler import decide
 from vera.decision.reply_policy import decide_reply
 from vera.domain.context import CategoryContext, CustomerContext, MerchantContext, TriggerContext
 from vera.generation.brief import build_brief, for_reply
-from vera.generation.composer import CTA_FALLBACK_TEXT, TemplateComposer, get_default_composer
+from vera.generation.composer import TemplateComposer, cta_fallback_text, get_default_composer
 from vera.observability.logging import log_event
 from vera.pipeline import compose_and_validate
 from vera.security.validation import exceeds_byte_limit
@@ -55,6 +55,19 @@ def _parse_datetime(value: str) -> datetime:
         return datetime.fromisoformat(value)
     except ValueError:
         return datetime.now(UTC)
+
+
+def _parse_tick_now(value: str) -> datetime | None:
+    # Deliberately distinct from _parse_datetime above: that helper's wall-clock fallback is
+    # correct for received_at (a display/logging timestamp), but the decision layer's staleness
+    # check must never substitute real time for a malformed TickRequest.now -- the evaluator must
+    # be able to control evaluation time deterministically. None here means "cannot determine",
+    # which decide()'s own now=None default already treats as "skip the staleness check", not as
+    # "assume not expired" or "assume expired" -- no policy is invented for the malformed case.
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 # Explicit GET+HEAD, not relying on any framework version's implicit HEAD-from-GET behavior
@@ -165,6 +178,7 @@ async def push_context(request: Request) -> JSONResponse:
 def tick(body: TickRequest) -> dict[str, Any]:
     start = time.monotonic()
     actions: list[dict[str, Any]] = []
+    tick_now = _parse_tick_now(body.now)
 
     for trigger_id in body.available_triggers:
         if len(actions) >= MAX_ACTIONS_PER_TICK:
@@ -194,7 +208,9 @@ def tick(body: TickRequest) -> dict[str, Any]:
         already_suppressed = store.suppression.is_used(
             merchant.merchant_id, trigger.suppression_key
         ) or store.suppression.is_merchant_suppressed(merchant.merchant_id)
-        decision = decide(merchant, trigger, customer, already_suppressed=already_suppressed, category=category)
+        decision = decide(
+            merchant, trigger, customer, already_suppressed=already_suppressed, category=category, now=tick_now
+        )
 
         log_event(
             "tick_decision",
@@ -246,7 +262,7 @@ def tick(body: TickRequest) -> dict[str, Any]:
         # end-to-end verification that caught the equivalent bug in TemplateComposer.
         template_subject = brief.customer_name or merchant.owner_first_name or merchant.name
         template_params = [template_subject, *brief.facts[:2]]
-        cta_phrase = CTA_FALLBACK_TEXT.get(decision.cta, "")
+        cta_phrase = cta_fallback_text(brief)
         if cta_phrase:
             template_params.append(cta_phrase)
 
@@ -275,6 +291,19 @@ def tick(body: TickRequest) -> dict[str, Any]:
         )
 
     return {"actions": actions}
+
+
+@app.post("/v1/teardown")
+def teardown() -> dict[str, Any]:
+    """Not part of the 5 scored endpoints (challenge-testing-brief.md SS2) but documented in
+    SS11's privacy requirement: 'Bots must not persist context data after the test ends. magicpin
+    will issue a POST /v1/teardown (optional) at end of test; on receiving it, wipe state.' No
+    request body is documented, so this accepts none and always succeeds -- there's no
+    partial-failure mode for wiping in-memory state.
+    """
+    store.teardown()
+    log_event("teardown")
+    return {"status": "ok"}
 
 
 @app.post("/v1/reply")
@@ -341,6 +370,17 @@ def reply(body: ReplyRequest) -> dict[str, Any]:
             # better than a send the contract would flag as malformed.
             conv.status = "ended"
             return {"action": "end", "rationale": "unable to produce a grounded, firewall-clean reply"}
+
+        if result.message in conv.sent_bodies:
+            # Contract (challenge-testing-brief.md §10): a verbatim repeat of a body already sent
+            # in this conversation is flagged "anti-repetition" and penalized (-2), independent of
+            # any other quality signal. No retry/re-prompt loop exists in this pipeline (by
+            # design — see compose_and_validate's docstring), so there is no next candidate to try
+            # instead; ending is the same safe choice already used for an empty/unsendable body,
+            # applied to a verbatim-duplicate one.
+            conv.status = "ended"
+            log_event("reply_rejected", conversation_id=body.conversation_id, reason="verbatim repeat of a body already sent in this conversation")
+            return {"action": "end", "rationale": "already said this in this conversation; nothing new to add"}
 
         conv.sent_bodies.add(result.message)
         return {"action": "send", "body": result.message, "cta": reply_brief.cta, "rationale": reply_decision.reason}

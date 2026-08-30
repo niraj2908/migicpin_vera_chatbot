@@ -99,6 +99,39 @@ def test_rejects_multiple_competing_ctas() -> None:
     assert any("competing CTA" in r for r in reasons)
 
 
+def test_rejects_the_previously_demonstrated_or_chain_evasion() -> None:
+    """Regression: 'Reply YES or NO, or reply 1 or 2...' offers 4 real options but was only ever
+    counted as 2 ('YES', '1') by a detector that only looked immediately after the literal word
+    'reply' -- found via adversarial testing, now closed by also following 'or'-chains attached
+    to a reply clause."""
+    brief = _brief(["available slot: Wed 5 Nov, 6pm"], cta="binary_yes_no")
+    ok, reasons = validate("Reply YES or NO, or reply 1 or 2 to choose a slot.", brief)
+    assert not ok
+    assert any("competing CTA" in r for r in reasons)
+
+
+def test_or_chain_detection_does_not_false_positive_on_the_official_reference_message() -> None:
+    """The official multi_choice_slot reference pattern ('Reply 1 for Wed, 2 for Thu, or tell us
+    a time that works.') must still pass -- the trailing 'or tell us...' is not an in-place
+    reply-X-or-Y chain and must not be miscounted as a second competing CTA."""
+    brief = _brief(["available slot: Wed 5 Nov, 6pm", "available slot: Thu 6 Nov, 5pm"], cta="multi_choice_slot")
+    ok, reasons = validate(
+        "Wed 5 Nov 6pm; Thu 6 Nov 5pm. Reply 1 for Wed, 2 for Thu, or tell us a time that works.", brief
+    )
+    assert ok, reasons
+
+
+def test_or_chain_detection_does_not_false_positive_on_unrelated_or_usage() -> None:
+    """'or' appearing elsewhere in a message, unrelated to any reply clause, must not be
+    miscounted."""
+    brief = _brief(["Diwali is 3 day(s) away"], cta="binary_yes_no")
+    ok, reasons = validate(
+        "Suresh, Diwali is 3 days away. Reply YES if you want this, or let us know if you have questions.",
+        brief,
+    )
+    assert ok, reasons
+
+
 def test_rejects_cta_when_none_expected() -> None:
     brief = _brief(["Diwali is 3 day(s) away"], cta="none")
     ok, reasons = validate("Just a heads up about Diwali. Reply YES if you want details.", brief)

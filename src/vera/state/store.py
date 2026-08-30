@@ -223,3 +223,13 @@ class Store:
         self.context = ContextStore()
         self.conversations = ConversationStore()
         self.suppression = SuppressionStore()
+
+    def teardown(self) -> None:
+        """Wipes all held state. Contract (challenge-testing-brief.md SS11): 'Bots must not
+        persist context data after the test ends. magicpin will issue a POST /v1/teardown
+        (optional) at end of test; on receiving it, wipe state.' Replaces each store in place
+        rather than mutating their internals, so any in-flight caller holding a reference to an
+        old lock finishes against a now-orphaned store instead of racing a cleared one."""
+        self.context = ContextStore()
+        self.conversations = ConversationStore()
+        self.suppression = SuppressionStore()

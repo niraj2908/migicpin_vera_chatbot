@@ -38,8 +38,10 @@ Rules you must never break:
 - If this message is going to a customer who has lapsed, been inactive, or missed a recall/
   refill window, be warm and matter-of-fact about it — never guilt-trip, shame, or imply blame
   for their absence. State the fact plainly and move straight to what's being offered.
-- If "customer_name" is present, name the sending merchant early in the message (e.g. "this is
-  {merchant_name}") — the customer needs to know who it's from, since it isn't from Vera itself.
+- If "customer_name" is present AND "is_first_message" is true, name the sending merchant early
+  in the message (e.g. "this is {merchant_name}") — the customer needs to know who it's from,
+  since it isn't from Vera itself. If "is_first_message" is false, do NOT re-introduce the
+  merchant or yourself again — the customer already knows who this conversation is with.
 - If "languages" or "customer_language_pref" includes "hi", natural Hindi-English code-mix is
   appropriate; otherwise write in English.
 - Stay under "max_chars" characters. No markdown, no placeholders like [name], no URLs.
@@ -113,6 +115,7 @@ def build_provider_payload(brief: CompositionBrief) -> dict[str, Any]:
         "dominant_signal": brief.dominant_signal,
         "max_chars": brief.max_chars,
         "reply_intent": brief.reply_intent,
+        "is_first_message": brief.is_first_message,
     }
 
 

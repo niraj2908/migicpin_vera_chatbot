@@ -19,6 +19,25 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 REPLY_TOKEN_RE = re.compile(r"\breply\s+([A-Za-z0-9]+)", re.IGNORECASE)
+# Demonstrated evasion (found via adversarial testing, not assumed): REPLY_TOKEN_RE alone only
+# counts tokens immediately following the literal word "reply", so "Reply YES or NO, or reply 1
+# or 2 to choose a slot." -- four real options -- was only ever counted as two ("YES", "1"),
+# staying under the >2 rejection threshold. This captures an "or"-chain of further alternatives
+# immediately following a "reply X" clause (no other words in between), so all four are counted.
+# Deliberately narrow: it only extends an existing "reply X" match, so it does not fire on
+# ordinary text containing "or" elsewhere (checked directly against the official multi_choice_slot
+# reference message, "Reply 1 for Wed, 2 for Thu, or tell us a time that works." -- the trailing
+# "or tell us..." is not part of an in-place "reply X or Y" chain and is correctly not counted).
+_REPLY_OR_CHAIN_RE = re.compile(r"\bor\s+([A-Za-z0-9]+)", re.IGNORECASE)
+_REPLY_CLAUSE_RE = re.compile(r"\breply\s+([A-Za-z0-9]+)((?:\s+or\s+[A-Za-z0-9]+)*)", re.IGNORECASE)
+
+
+def _reply_tokens(message: str) -> set[str]:
+    tokens: set[str] = set()
+    for match in _REPLY_CLAUSE_RE.finditer(message):
+        tokens.add(match.group(1).upper())
+        tokens.update(t.upper() for t in _REPLY_OR_CHAIN_RE.findall(match.group(2)))
+    return tokens
 _PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\[name\]|\[merchant", re.IGNORECASE)
 
 # CTA-presence contract: a binary_yes_no/binary_confirm_cancel message must contain BOTH an
@@ -116,7 +135,7 @@ def validate(message: str, brief: CompositionBrief) -> tuple[bool, list[str]]:
         if taboo.lower() in message_lower:
             reasons.append(f"uses taboo phrase for this category: {taboo!r}")
 
-    reply_tokens = {t.upper() for t in REPLY_TOKEN_RE.findall(message)}
+    reply_tokens = _reply_tokens(message)
     if brief.cta == "none" and reply_tokens:
         reasons.append("message asks for a reply but cta is 'none'")
     elif len(reply_tokens) > 2:

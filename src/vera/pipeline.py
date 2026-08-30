@@ -2,7 +2,7 @@ import concurrent.futures
 from dataclasses import dataclass
 
 from vera.generation.brief import CompositionBrief
-from vera.generation.composer import CTA_FALLBACK_TEXT, Composer, TemplateComposer
+from vera.generation.composer import Composer, TemplateComposer, cta_fallback_text
 from vera.generation.firewall import has_explicit_binary_cta, validate
 from vera.observability.logging import log_event
 from vera.security.redact import redact_secrets
@@ -83,7 +83,7 @@ def _try_cta_correction(message: str, brief: CompositionBrief) -> str | None:
     """
     if has_explicit_binary_cta(message, brief.cta):
         return None
-    cta_text = CTA_FALLBACK_TEXT.get(brief.cta, "")
+    cta_text = cta_fallback_text(brief)
     if not cta_text:
         return None
     corrected = f"{message} {cta_text}".strip()

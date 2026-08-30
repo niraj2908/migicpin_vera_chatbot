@@ -21,6 +21,7 @@ __all__ = [
     "Composer",
     "GeminiComposer",
     "TemplateComposer",
+    "cta_fallback_text",
     "get_default_composer",
 ]
 
@@ -33,6 +34,54 @@ _CTA_FALLBACK_TEXT = {
 }
 # Public alias kept for backward compatibility with existing callers/tests.
 CTA_FALLBACK_TEXT = _CTA_FALLBACK_TEXT
+
+# Hindi-preferring variant, used only for merchants/customers whose declared language preference
+# includes Hindi (same "includes 'hi'" detection the LLM system prompt already uses in
+# shared.py, kept consistent rather than inventing a second convention). Reuses vocabulary
+# already registered and tested in firewall.py's own _CTA_ACTION_PHRASES/_CTA_OPTION_WORDS
+# ("bata dijiye", "haan"/"nahi") rather than inventing new Hindi phrasing -- verified directly
+# against has_explicit_binary_cta() before wiring in, so these are guaranteed firewall-passing
+# by construction, not just by inspection. binary_confirm_cancel is deliberately left in English:
+# no Hindi variant of "confirm"/"cancel" is evidenced anywhere in the challenge package, and
+# Case Study 9's own real reference message keeps "Reply CONFIRM" in English even in an
+# otherwise Hindi-mixed body -- matching, not inventing, the established pattern.
+_CTA_FALLBACK_TEXT_HI = {
+    "open_ended": "Bata dijiye agar aur jaankari chahiye.",
+    "binary_yes_no": "Haan ya nahi, bata dijiye.",
+    "binary_confirm_cancel": "Reply CONFIRM to proceed.",
+    "multi_choice_slot": "Apna preferred option bata dijiye.",
+    "none": "",
+}
+
+
+def _prefers_hindi(brief: CompositionBrief) -> bool:
+    """Same detection the LLM system prompt already documents: customer preference takes
+    priority when present (a customer-facing message should match the specific customer, not
+    just the merchant's general language list); otherwise fall back to the merchant's own
+    declared languages."""
+    if brief.customer_language_pref:
+        return "hi" in brief.customer_language_pref.lower()
+    return any("hi" in lang.lower() for lang in brief.languages)
+
+
+def cta_fallback_text(brief: CompositionBrief) -> str:
+    """The single source of truth for 'what fixed, decision-owned CTA phrase does this brief's
+    cta map to', language-aware. Used by TemplateComposer directly, and by pipeline.py's bounded
+    CTA-correction step (appending a missing CTA to an otherwise-valid LLM message) -- both
+    paths must agree, so a Hindi-composed LLM message missing its CTA doesn't get an
+    English-only phrase jarringly appended to it."""
+    cta_table = _CTA_FALLBACK_TEXT_HI if _prefers_hindi(brief) else _CTA_FALLBACK_TEXT
+    return cta_table.get(brief.cta, "")
+
+
+def _join_facts_naturally(facts: list[str]) -> str:
+    """"; "-joins all but the last fact and "; and "-joins the last, instead of a flat run of
+    semicolons -- a small, purely structural change (works identically regardless of category or
+    fact count) that reads less like a mail-merge without altering which facts are said or their
+    own wording. A single fact is returned unchanged."""
+    if len(facts) <= 1:
+        return facts[0] if facts else ""
+    return "; ".join(facts[:-1]) + "; and " + facts[-1]
 
 
 class Composer(Protocol):
@@ -82,18 +131,26 @@ class TemplateComposer:
         # opportunity generator: TemplateComposer previously always greeted the merchant even
         # when send_as=merchant_on_behalf and the message was addressed to a specific customer.
         subject = brief.customer_name or brief.owner_first_name or brief.merchant_name
-        sanitized_facts = [_sanitize_fact(f) for f in brief.facts]
-        fact_text = "; ".join(f for f in sanitized_facts if f) or brief.merchant_name
-        cta_text = _CTA_FALLBACK_TEXT.get(brief.cta, "")
+        sanitized_facts = [f for f in (_sanitize_fact(f) for f in brief.facts) if f]
+        fact_text = _join_facts_naturally(sanitized_facts) or brief.merchant_name
+        cta_text = cta_fallback_text(brief)
         prefix = {
             "accept_and_advance": "Great, moving ahead. ",
             "redirect_to_original_ask": "Noted. Coming back to this: ",
         }.get(brief.reply_intent or "", "")
         # Both real customer-facing case studies in the challenge package open by naming the
         # sending merchant ("Dr. Meera's clinic here" / "Karthik from PowerHouse here") — a
-        # customer receiving a message on a merchant's behalf needs to know who it's from.
-        merchant_intro = f"this is {brief.merchant_name}. " if brief.customer_name else ""
-        message = f"{prefix}{subject}, {merchant_intro}{fact_text}." + (f" {cta_text}" if cta_text else "")
+        # customer receiving a message on a merchant's behalf needs to know who it's from. But
+        # only once: challenge-brief.md SS11 explicitly names "re-introducing yourself after the
+        # first message" as a judge-penalized anti-pattern, and every /v1/reply send is by
+        # construction not the first message in its conversation (see CompositionBrief.is_first_message).
+        merchant_intro = f"this is {brief.merchant_name}. " if brief.customer_name and brief.is_first_message else ""
+        # Generic, not curious_ask_due-specific: a fact that is itself a question (e.g. from
+        # opportunity.py's _readable_question()) already ends in "?" -- appending "." unconditionally
+        # would double-punctuate it ("...this week?."). Every existing generator's facts are
+        # declarative and never end in "?"/"!", so this is a no-op for all of them.
+        terminal = "" if fact_text.endswith(("?", "!")) else "."
+        message = f"{prefix}{subject}, {merchant_intro}{fact_text}{terminal}" + (f" {cta_text}" if cta_text else "")
         return message[: brief.max_chars]
 
 

@@ -82,12 +82,22 @@ def test_fallback_cta_matches_the_decision_across_scenarios() -> None:
         engagement = evaluate(message, brief).engagement_signals
         assert engagement["single_clear_cta"], (merchant_id, message)
         assert engagement["no_generic_filler"], (merchant_id, engagement["generic_filler_phrases"], message)
-        # binary_yes_no / open_ended both expect exactly what the fallback's fixed CTA_FALLBACK_TEXT
-        # table produces for that cta value — never a mismatched or invented ask.
+        # binary_yes_no / open_ended both expect exactly what the fallback's fixed CTA table
+        # produces for that cta value — never a mismatched or invented ask. Language-aware: this
+        # real merchant (m_005) lists "hi" among its languages, so its fallback CTA is correctly
+        # the Hindi variant (haan/nahi + bata dijiye), reusing the same firewall-tested Hindi CTA
+        # vocabulary added this session — never the English phrase for a Hindi-preferring
+        # merchant, and never a mismatched/invented one either way.
+        from vera.generation.composer import _prefers_hindi
+
+        hindi = _prefers_hindi(brief)
         if brief.cta == "binary_yes_no":
-            assert "YES" in message
+            assert ("YES" in message) if not hindi else ("haan" in message.lower() and "nahi" in message.lower())
         elif brief.cta == "open_ended":
-            assert "?" in message or "share more" in message.lower()
+            if hindi:
+                assert "bata dijiye" in message.lower()
+            else:
+                assert "?" in message or "share more" in message.lower()
 
 
 def test_fallback_never_mentions_an_offer_it_does_not_have() -> None:

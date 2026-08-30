@@ -46,6 +46,22 @@ class CategoryContext:
         items = [item for item in self.raw.get("digest", []) if isinstance(item, dict)]
         return items if kind is None else [item for item in items if item.get("kind") == kind]
 
+    @property
+    def peer_avg_review_count(self) -> float | None:
+        # The one peer_stats field with no "_30d"/window suffix in the real seed data (unlike
+        # avg_views_30d/avg_calls_30d/avg_directions_30d) -- a lifetime/cumulative peer average,
+        # not a windowed one. Optional rather than 0.0: a merchant category with no peer_stats
+        # block at all must never be treated as "peer average of zero".
+        peer_stats = self.raw.get("peer_stats", {})
+        value = peer_stats.get("avg_review_count") if isinstance(peer_stats, dict) else None
+        return float(value) if isinstance(value, (int, float)) else None
+
+    @property
+    def peer_stats_scope(self) -> str | None:
+        peer_stats = self.raw.get("peer_stats", {})
+        scope = peer_stats.get("scope") if isinstance(peer_stats, dict) else None
+        return str(scope) if scope else None
+
 
 @dataclass(frozen=True)
 class MerchantContext:
@@ -99,6 +115,14 @@ class MerchantContext:
         aggregate = self.raw.get("customer_aggregate", {})
         count = aggregate.get("chronic_rx_count") if isinstance(aggregate, dict) else None
         return int(count) if isinstance(count, (int, float)) else None
+
+    @property
+    def review_themes(self) -> list[dict[str, Any]]:
+        # Real field, separate from any single trigger's own payload -- entries carry
+        # {theme, sentiment, occurrences_30d} and sometimes common_quote. A review_theme_emerged
+        # trigger's own payload never carries sentiment; cross-referencing this list by theme name
+        # is the only real source of it.
+        return [t for t in self.raw.get("review_themes", []) if isinstance(t, dict)]
 
     @property
     def conversation_history(self) -> list[dict[str, Any]]:
@@ -173,3 +197,12 @@ class TriggerContext:
     @property
     def suppression_key(self) -> str:
         return str(self.raw.get("suppression_key", ""))
+
+    @property
+    def expires_at(self) -> str | None:
+        # Raw string passthrough only -- deliberately no parsing here, matching this class's own
+        # convention (thin typed accessor over the verbatim payload, per this module's docstring).
+        # Datetime parsing/comparison belongs to the decision layer, which is where the other
+        # value it must be compared against (the tick's own `now`) already lives.
+        value = self.raw.get("expires_at")
+        return str(value) if value else None

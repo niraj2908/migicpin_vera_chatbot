@@ -24,6 +24,13 @@ class CompositionBrief:
     max_chars: int = 400
     forbidden_topics: list[str] = field(default_factory=list)
     reply_intent: str | None = None
+    # True for the proactive /v1/tick send that opens a conversation (build_brief's default,
+    # since try_reserve() guarantees conversation_id is new whenever build_brief is called);
+    # for_reply() always sets this False, since by construction a /v1/reply send is never the
+    # first message in its conversation. Lets both composers stop re-introducing the sending
+    # merchant on turn 2+ -- challenge-brief.md SS11 names this exact anti-pattern
+    # ("Re-introducing yourself after the first message") as one the judge penalizes.
+    is_first_message: bool = True
 
 
 def build_brief(
@@ -55,4 +62,4 @@ def for_reply(original: CompositionBrief, reply_intent: str) -> CompositionBrief
 
     The deterministic reply policy decides `reply_intent`; the LLM only rephrases around it.
     """
-    return replace(original, reply_intent=reply_intent)
+    return replace(original, reply_intent=reply_intent, is_first_message=False)

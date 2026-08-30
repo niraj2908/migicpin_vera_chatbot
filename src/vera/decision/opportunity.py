@@ -119,9 +119,21 @@ def _festival_opportunity(
 
     if not festival or merchant.category_slug not in category_relevance:
         return None
+    # Hard gate, not a soft floor -- the same discipline renewal_due already applies to its own
+    # days_remaining field, reusing that exact TIMELINESS_WINDOW_DAYS constant rather than
+    # inventing a new number. Found necessary via adversarial audit: the real seed's own
+    # festival_upcoming trigger is 188 days out (the brief's own canonical example is "Diwali in
+    # 4 days", challenge-brief.md line 130) -- previously, ANY out-of-window days_until fell back
+    # to a fixed, non-decaying 0.3/0.2 "weak but nonzero" pair, and merchant_relevance +
+    # actionability + engagement_potential alone already sum to 2.6/5.0 = 0.52 (itself above
+    # SEND_THRESHOLD) whenever a real offer exists -- meaning an offer could rescue a send at 15
+    # days or 15 years away identically; the score was never actually sensitive to *how far* past
+    # the window a festival was. Only a hard gate closes this regardless of offer/urgency.
+    if days_until is None or not (0 <= days_until <= TIMELINESS_WINDOW_DAYS):
+        return None
 
-    trigger_strength = 1.0 if days_until is not None and 0 <= days_until <= TIMELINESS_WINDOW_DAYS else 0.3
-    timeliness = _clamp(1 - (days_until / TIMELINESS_WINDOW_DAYS)) if days_until is not None else 0.2
+    trigger_strength = 1.0  # gated above: only ever reached inside the window
+    timeliness = _clamp(1 - (days_until / TIMELINESS_WINDOW_DAYS))
 
     active_offers = merchant.active_offers
     has_offer = bool(active_offers)
@@ -133,7 +145,7 @@ def _festival_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / MAX_RAW_SCORE) * urgency_factor)
 
-    facts = [f"{festival} is {days_until} day(s) away" if days_until is not None else str(festival)]
+    facts = [f"{festival} is {days_until} day(s) away"]
     for offer in active_offers:
         title = offer.get("title")
         if title:
@@ -413,18 +425,40 @@ def _recall_due_opportunity(
 
 def _already_discussed_in_conversation_history(merchant: MerchantContext, molecule: str) -> bool:
     """Narrow, bounded check — not a general text-matching engine: does a specific molecule name
-    already appear in a prior message *from Vera* to this merchant? Found necessary from the
-    real seed data itself: m_009_apollo_pharmacy_jaipur's conversation_history already shows a
-    prior "voluntary recall on atorvastatin..." message the merchant replied "Yes send me the
-    list please" (engagement: intent_action) to — composing a fresh identical pitch on this
-    exact canonical scenario would be a real, demonstrable repetition/Decision-Quality failure,
-    not a hypothetical one. A single substring check against one specific payload field, not a
-    framework."""
+    already appear in a prior message *from Vera*, WITH genuine two-sided engagement evidence
+    (at least one separate entry from the other side), rather than a one-sided Vera monologue?
+    Found necessary from the real seed data itself: m_009_apollo_pharmacy_jaipur's
+    conversation_history already shows a prior "voluntary recall on atorvastatin..." message AND
+    a separate merchant reply "Yes send me the list please" (engagement: intent_action) —
+    composing a fresh identical pitch on this exact canonical scenario would be a real,
+    demonstrable repetition/Decision-Quality failure, not a hypothetical one.
+
+    P1 fix (hostile-audit finding): this check reads merchant.conversation_history, which is
+    judge-supplied context (challenge-brief.md/engagement-design.md document it as "last N turns
+    w/ Vera, with engagement tags" -- historical context, never described as an authoritative
+    record of what THIS bot instance has sent) -- previously a single injected "vera"-authored
+    entry, with no corresponding reply, was sufficient on its own to suppress an otherwise fully
+    justified compliance/safety alert (score 1.0, the clamped maximum for the real seed case, so
+    no bounded scoring adjustment could ever fix this -- only a hard gate can, and only a
+    correspondingly harder-to-forge gate closes the exploit). Requiring a genuine second,
+    other-side entry is grounded directly in the real data's own actual shape, not an invented
+    threshold -- it closes the specific single-field attack demonstrated in the audit. It is NOT
+    a claim of cryptographic unforgeability: the judge legitimately controls this entire payload
+    in one request, and no purely structural check on its content can fully rule out a more
+    elaborate two-sided fabrication -- that is an architectural limit of trusting judge-supplied
+    historical context at all, not something this fix can close further without inventing a
+    verification mechanism the contract does not provide."""
     molecule_lower = molecule.lower()
-    return any(
+    vera_mentioned_it = any(
         entry.get("from") == "vera" and molecule_lower in str(entry.get("body", "")).lower()
         for entry in merchant.conversation_history
     )
+    if not vera_mentioned_it:
+        return False
+    other_side_responded = any(
+        entry.get("from") not in (None, "vera") for entry in merchant.conversation_history
+    )
+    return other_side_responded
 
 
 def _supply_alert_opportunity(
@@ -493,12 +527,591 @@ def _supply_alert_opportunity(
     )
 
 
+# Positive mirror of _seasonal_dip_reframe_opportunity's magnitude gate: a spike smaller than
+# this is nothing worth interrupting the merchant about. 0.10 mirrors _MEANINGFUL_DIP_THRESHOLD's
+# magnitude symmetrically; the one real seed example (perf_spike:m_008, calls +15%) clears it
+# with room, and there's no evidence to support a different cutoff.
+_MEANINGFUL_SPIKE_THRESHOLD = 0.10
+
+
+def _perf_spike_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,  # unused: no category digest lookup needed for this decision
+) -> Opportunity | None:
+    if trigger.kind != "perf_spike":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    metric = payload.get("metric")
+    delta_pct_raw = payload.get("delta_pct")
+    delta_pct: float | None = delta_pct_raw if isinstance(delta_pct_raw, (int, float)) else None
+    likely_driver = payload.get("likely_driver")
+    vs_baseline = payload.get("vs_baseline")
+
+    # Hard gate, same reasoning as the dip's own: below-threshold movement isn't a real spike,
+    # and a missing metric/delta leaves nothing grounded to report.
+    if metric is None or delta_pct is None:
+        return None
+    if delta_pct < _MEANINGFUL_SPIKE_THRESHOLD:
+        return None
+
+    magnitude_signal = 1.0 if delta_pct >= _MEANINGFUL_SPIKE_THRESHOLD * 2 else 0.6
+
+    active_offers = merchant.active_offers
+    has_offer = bool(active_offers)
+    # A spike is a "double down" moment: a concrete offer to push harder on is more actionable
+    # than a bare "keep it up", mirroring the dip generator's own has_offer/actionability split.
+    actionability = 1.0 if has_offer else 0.5
+
+    trigger_relevance = 1.0  # gated above: only ever reached past the meaningful-spike threshold
+    engagement_potential = 0.6  # same fixed baseline every other generator uses
+
+    raw = trigger_relevance + magnitude_signal + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    facts = [f"{metric} up {delta_pct * 100:.0f}% this week"]
+    if isinstance(vs_baseline, (int, float)):
+        facts.append(f"vs a baseline of {vs_baseline}")
+    if isinstance(likely_driver, str) and likely_driver:
+        facts.append(f"likely driver: {likely_driver.replace('_', ' ')}")
+    for offer in active_offers:
+        title = offer.get("title")
+        if title:
+            facts.append(str(title))
+
+    return Opportunity(
+        name="perf_spike",
+        action_type="perf_spike_capitalize",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=[
+            "trigger.payload.metric",
+            "trigger.payload.delta_pct",
+            "trigger.payload.vs_baseline",
+            "trigger.payload.likely_driver",
+            "trigger.urgency",
+            "merchant.offers",
+        ],
+        reason=(
+            f"{metric} is up {delta_pct * 100:.0f}% — a real, grounded moment to help the "
+            f"merchant capitalize on whatever's working rather than let it pass unnoticed."
+        ),
+    )
+
+
+def _milestone_reached_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,
+) -> Opportunity | None:
+    if trigger.kind != "milestone_reached":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    metric = payload.get("metric")
+    value_now_raw = payload.get("value_now")
+    milestone_value_raw = payload.get("milestone_value")
+    value_now: float | None = value_now_raw if isinstance(value_now_raw, (int, float)) else None
+    milestone_value: float | None = (
+        milestone_value_raw if isinstance(milestone_value_raw, (int, float)) else None
+    )
+    is_imminent = payload.get("is_imminent") is True
+
+    # Without both real numbers there is no grounded milestone claim to make at all.
+    if metric is None or value_now is None or milestone_value is None:
+        return None
+    already_crossed = value_now >= milestone_value
+    # Neither "about to cross" nor "already crossed" alone — nothing worth a message yet.
+    if not already_crossed and not is_imminent:
+        return None
+
+    trigger_relevance = 1.0
+    milestone_signal = 1.0 if already_crossed else 0.7  # a crossed milestone is a firmer,
+    # more celebratory fact than an approaching one, mirroring the dip generator's magnitude split.
+    engagement_potential = 0.7  # a milestone is inherently a positive, low-friction, celebratory
+    # nudge — scored slightly above the 0.6 baseline other generators use, on the same evidence
+    # basis the dip/spike generators use fixed constants: a documented, explainable choice, not
+    # an arbitrary one, reflecting that this action_type carries no ask beyond "worth noting".
+    actionability = 0.6  # a real next step exists (share it publicly) even with no offer involved
+
+    raw = trigger_relevance + milestone_signal + engagement_potential + actionability
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    metric_readable = metric.replace("_", " ")
+    if already_crossed:
+        facts = [f"{metric_readable}: {value_now:.0f}, past the {milestone_value:.0f} milestone"]
+    else:
+        facts = [f"{metric_readable}: {value_now:.0f}, {milestone_value:.0f} milestone within reach"]
+
+    evidence = [
+        "trigger.payload.metric",
+        "trigger.payload.value_now",
+        "trigger.payload.milestone_value",
+        "trigger.payload.is_imminent",
+        "trigger.urgency",
+    ]
+
+    # Social-proof enrichment (challenge-brief.md SS10 lever #3, named as one of the two levers
+    # production Vera under-uses today) -- gated narrowly, on real evidence only, never on every
+    # milestone message:
+    #   - metric must be "review_count" specifically: it's the one real trigger.payload metric
+    #     with no "window" field (a lifetime/cumulative count) and the one peer_stats field with
+    #     no "_30d" suffix (also cumulative) -- every other real metric (calls/views) is a 7-day
+    #     trigger figure being compared against a 30-day peer average, an apples-to-oranges
+    #     mismatch this deliberately does not attempt.
+    #   - category.peer_avg_review_count must actually be present (never fabricated if missing).
+    #   - only surfaced when value_now is at or above the peer average: this action_type is a
+    #     celebration, and an unflattering below-peer comparison has no place inside one -- the
+    #     underlying milestone still sends exactly as before either way, just without this fact.
+    # Two real numbers stated plainly, no adjective ("well above"/"far ahead"), no percentile, no
+    # rank -- nothing not directly in category.peer_stats.
+    if category is not None and metric == "review_count":
+        peer_avg = category.peer_avg_review_count
+        if peer_avg is not None and value_now >= peer_avg:
+            scope_label = category.peer_stats_scope
+            if scope_label:
+                facts.append(f"peer average for {scope_label.replace('_', ' ')} is {peer_avg:.0f} reviews")
+            else:
+                facts.append(f"peer average is {peer_avg:.0f} reviews")
+            evidence.append("category.peer_stats.avg_review_count")
+
+    return Opportunity(
+        name="milestone_reached",
+        action_type="milestone_celebration",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=evidence,
+        reason=(
+            f"{metric_readable} is at {value_now:.0f} against a {milestone_value:.0f} milestone — "
+            f"a genuine, grounded reason to reach out with something positive rather than only "
+            f"ever messaging about problems."
+        ),
+    )
+
+
+# How close counts as "nearby" for this trigger kind, in the evidence-disciplined sense
+# engagement-design.md itself uses ("competitor opens nearby") -- no specific radius is
+# documented anywhere in the contract, so this formalizes the boundary this generator's OWN
+# scoring already treated as meaningful (the second proximity tier below), rather than inventing
+# a new number. The real seed's only example (1.3km, matching challenge-brief.md's own canonical
+# "new dentist 1.3km away") sits comfortably inside it.
+_NEARBY_COMPETITOR_RADIUS_KM = 5.0
+
+
+def _competitor_opened_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,  # unused: no category digest lookup needed for this decision
+) -> Opportunity | None:
+    if trigger.kind != "competitor_opened":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    competitor_name = payload.get("competitor_name")
+    distance_km_raw = payload.get("distance_km")
+    distance_km: float | None = distance_km_raw if isinstance(distance_km_raw, (int, float)) else None
+    their_offer = payload.get("their_offer")
+    opened_date = payload.get("opened_date")
+
+    # A competitor claim with no name and no distance is nothing grounded to report at all.
+    if not competitor_name or distance_km is None:
+        return None
+    # Hard gate, not a soft floor -- found necessary via adversarial audit: a fixed, non-decaying
+    # 0.3 floor for ANY out-of-tier distance meant trigger_relevance + actionability +
+    # engagement_potential alone (2.2-2.6/3.6, itself above SEND_THRESHOLD) let a competitor
+    # thousands of km away send identically to one 1.3km away. Same fix shape as
+    # festival_upcoming's own timeliness gate: continuous decay alone can't work here either
+    # (those three terms sum above threshold regardless of proximity), so only a hard gate closes
+    # it. "Nearby" (engagement-design.md's own word for this trigger family) stops meaning
+    # anything past this radius, so there's nothing grounded left to report beyond it.
+    if distance_km > _NEARBY_COMPETITOR_RADIUS_KM:
+        return None
+
+    # Proximity is used only as a continuous scoring input inside the nearby radius (closer =
+    # more relevant to inform the merchant about) -- the real seed's only example (1.3km) sits in
+    # the top tier, and there's no finer-grained evidence to justify more tiers than these two.
+    proximity_signal = 1.0 if distance_km <= 2.0 else 0.6
+
+    has_offer_context = bool(their_offer)
+    actionability = 1.0 if has_offer_context else 0.6  # a competitor's specific offer gives a
+    # concrete comparison point; without one, still worth flagging the opening itself.
+
+    trigger_relevance = 1.0
+    engagement_potential = 0.6
+
+    raw = trigger_relevance + proximity_signal + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    facts = [f"{competitor_name} opened {distance_km:g}km away"]
+    if isinstance(opened_date, str) and opened_date:
+        facts.append(f"opened {opened_date}")
+    if isinstance(their_offer, str) and their_offer:
+        facts.append(f"their offer: {their_offer}")
+
+    return Opportunity(
+        name=f"competitor_opened:{competitor_name}",
+        action_type="competitor_awareness",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=[
+            "trigger.payload.competitor_name",
+            "trigger.payload.distance_km",
+            "trigger.payload.their_offer",
+            "trigger.payload.opened_date",
+            "trigger.urgency",
+        ],
+        reason=(
+            f"{competitor_name} opened {distance_km:g}km away — the merchant should hear this "
+            f"from Vera first, informational and neutral, not alarmist."
+        ),
+    )
+
+
+# TIMELINESS_WINDOW_DAYS (14, module-level) is reused here rather than a new invented constant —
+# same "worth mentioning inside this window" reasoning festival_upcoming already applies to its
+# own days_until field. The one real example (days_remaining=12) sits comfortably inside it.
+def _renewal_due_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,  # unused: no category digest lookup needed for this decision
+) -> Opportunity | None:
+    if trigger.kind != "renewal_due":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    days_remaining_raw = payload.get("days_remaining")
+    days_remaining: float | None = (
+        days_remaining_raw if isinstance(days_remaining_raw, (int, float)) else None
+    )
+    plan = payload.get("plan")
+    renewal_amount = payload.get("renewal_amount")
+
+    if days_remaining is None or plan is None:
+        return None
+    # Too early to be worth interrupting the merchant about yet -- same window as festival_upcoming.
+    if not (0 <= days_remaining <= TIMELINESS_WINDOW_DAYS):
+        return None
+
+    timeliness = _clamp(1 - (days_remaining / TIMELINESS_WINDOW_DAYS))
+    trigger_relevance = 1.0  # gated above: only reached inside the timeliness window
+    engagement_potential = 0.6
+
+    raw = trigger_relevance + timeliness + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 2.6) * urgency_factor)
+
+    facts = [f"{plan} plan renews in {days_remaining:.0f} day(s)"]
+    if isinstance(renewal_amount, (int, float)):
+        facts.append(f"renewal amount ₹{renewal_amount:g}")
+
+    return Opportunity(
+        name="renewal_due",
+        action_type="renewal_reminder",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=[
+            "trigger.payload.days_remaining",
+            "trigger.payload.plan",
+            "trigger.payload.renewal_amount",
+            "trigger.urgency",
+        ],
+        reason=(
+            f"{plan} plan renews in {days_remaining:.0f} day(s) — a timely, practical heads-up "
+            f"about the merchant's own account, not a business-growth pitch."
+        ),
+    )
+
+
+def _readable_question(ask_template: str) -> str:
+    """Mechanical transform of the real trigger.payload.ask_template string only -- never a
+    lookup table of known phrasings. The one real example ("what_service_in_demand_this_week")
+    reads as a near-complete question once de-slugged; this must generalize to any future
+    ask_template value the judge might push, not just the one seen in the seed data, so it does
+    nothing smarter than de-slug + capitalize + ensure a trailing '?' -- the same discipline
+    already used for trigger.payload.previous_focus elsewhere in this file."""
+    words = ask_template.replace("_", " ").strip()
+    if not words:
+        return words
+    text = words[0].upper() + words[1:]
+    return text if text.endswith("?") else f"{text}?"
+
+
+def _curious_ask_due_opportunity(
+    merchant: MerchantContext,  # unused: no merchant-state precondition evidenced for this kind
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,  # unused: no category digest/vocab lookup needed
+) -> Opportunity | None:
+    """challenge-brief.md SS10 names 'asking the merchant' (lever #7, e.g. "what's your
+    most-asked treatment this week?") and 'social proof' (lever #3) as the two levers production
+    Vera under-uses today. This generator is the only current opportunity kind whose whole point
+    is a genuine, low-stakes QUESTION rather than a pitch -- Vera has enough evidence a curiosity-
+    ask is due (the trigger itself, scheduled by the judge/data pipeline's own weekly cadence, not
+    re-derived here) but deliberately does not claim to know the answer, recommend an action, or
+    invent any urgency/statistic around it.
+    """
+    if trigger.kind != "curious_ask_due":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    ask_template = payload.get("ask_template")
+    last_ask_at = payload.get("last_ask_at")
+
+    # No template, nothing grounded to ask -- insufficient evidence, not a low score.
+    if not isinstance(ask_template, str) or not ask_template.strip():
+        return None
+
+    trigger_relevance = 1.0  # the trigger's own existence is the judge/data pipeline's
+    # classification that this ask is due now -- same evidence-disciplined trust already applied
+    # to customer_lapsed_hard/recall_due, not re-derived from last_ask_at (no evidenced
+    # "how-recent-is-too-recent" threshold exists anywhere in the contract).
+    actionability = 1.0  # gated above: only reached with a real, non-empty template
+    engagement_potential = 0.6  # same fixed baseline every generator in this file reuses
+
+    raw = trigger_relevance + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 2.6) * urgency_factor)
+
+    facts = [_readable_question(ask_template)]
+    if isinstance(last_ask_at, str) and last_ask_at:
+        facts.append(f"last asked this on {last_ask_at}")
+
+    return Opportunity(
+        name="curious_ask",
+        action_type="curious_ask",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=[
+            "trigger.kind",
+            "trigger.payload.ask_template",
+            "trigger.payload.last_ask_at",
+            "trigger.urgency",
+        ],
+        reason=(
+            "A curiosity-ask is due for this merchant -- worth a genuine, low-stakes question "
+            "rather than a pitch; the merchant's answer is itself the value, not assumed."
+        ),
+    )
+
+
+def _perf_dip_opportunity(
+    merchant: MerchantContext,  # unused: no evidenced merchant-state precondition for this kind
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,  # deliberately unused -- see the peer_stats note below
+) -> Opportunity | None:
+    """The unexpected-decline sibling of _seasonal_dip_reframe_opportunity: that generator hard-
+    gates on payload.is_expected_seasonal being true and reassures ("this is normal"); perf_dip's
+    real payload carries no such flag at all, so there is no expected/seasonal story to tell here
+    -- only a plain, real decline, presented professionally and without a claimed cause.
+
+    Reuses _MEANINGFUL_DIP_THRESHOLD/_STRONG_DIP_THRESHOLD (module-level, already defined for
+    seasonal_perf_dip) rather than inventing a new magnitude cutoff -- both trigger kinds report
+    the same delta_pct shape, and "how much decline is meaningful" is not evidenced to differ
+    between them.
+
+    No peer_stats comparison: perf_dip's real payload carries "window": "7d" (7-day), while
+    category.peer_stats' avg_calls_30d/avg_views_30d are 30-day averages -- the same window
+    mismatch _milestone_reached_opportunity's own peer-stats enrichment was scoped away from.
+    Comparing a 7-day figure to a 30-day peer average would be exactly the kind of comparison the
+    data doesn't support, so this deliberately never attempts it, however tempting the data
+    "looks" adjacent.
+
+    No active_offers reference either (unlike its seasonal sibling, which treats an offer as a
+    reassuring "pivot"): juxtaposing "your calls dropped" with "here's an offer" risks reading as
+    an implied cause-and-cure this generator has no evidence for. The message states the decline
+    and nothing else grounded enough to add.
+    """
+    if trigger.kind != "perf_dip":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    metric = payload.get("metric")
+    delta_pct_raw = payload.get("delta_pct")
+    delta_pct: float | None = delta_pct_raw if isinstance(delta_pct_raw, (int, float)) else None
+    vs_baseline = payload.get("vs_baseline")
+
+    if metric is None or delta_pct is None:
+        return None
+    # Hard gate, not a low score -- same reasoning as every other magnitude-gated generator in
+    # this file (a below-threshold movement isn't a "dip" worth a message at all).
+    if delta_pct > _MEANINGFUL_DIP_THRESHOLD:
+        return None
+
+    magnitude_signal = 1.0 if delta_pct <= _STRONG_DIP_THRESHOLD else 0.4  # same tiers as the
+    # seasonal sibling's own magnitude split, reused rather than invented.
+    has_baseline = isinstance(vs_baseline, (int, float))
+    actionability = 1.0 if has_baseline else 0.5  # a concrete reference number gives the merchant
+    # something specific to react to; without one, still a real, if barer, fact to surface.
+    trigger_relevance = 1.0  # gated above: only ever reached past the meaningful-dip threshold
+    engagement_potential = 0.6  # same fixed baseline every generator in this file reuses
+
+    raw = trigger_relevance + magnitude_signal + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    facts = [f"{metric} down {abs(delta_pct) * 100:.0f}% this week"]
+    if has_baseline:
+        facts.append(f"vs a baseline of {vs_baseline}")
+
+    return Opportunity(
+        name="perf_dip",
+        action_type="perf_dip_flag",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=[
+            "trigger.payload.metric",
+            "trigger.payload.delta_pct",
+            "trigger.payload.vs_baseline",
+            "trigger.urgency",
+        ],
+        reason=(
+            f"{metric} is down {abs(delta_pct) * 100:.0f}% — a real, meaningful decline worth "
+            f"surfacing plainly and inviting a conversation, without assuming a cause or "
+            f"promising a fix Vera has no evidence for."
+        ),
+    )
+
+
+def _theme_sentiment(merchant: MerchantContext, theme: str) -> str | None:
+    """The real cross-reference this generator relies on for sentiment: a review_theme_emerged
+    trigger's own payload never carries a sentiment field (confirmed against the one real
+    instance, trg_011_review_theme_late_delivery) -- only merchant.review_themes[] does, keyed by
+    the same theme string. Verified against real data: that trigger's merchant
+    (m_005_pizzajunction) has a review_themes entry {"theme": "delivery_late", "sentiment": "neg",
+    "occurrences_30d": 4} matching both the theme name AND the occurrence count exactly -- the
+    same real event, not a coincidental match. Returns None (not a guessed default) when no
+    matching entry exists, or when the matched entry's own sentiment isn't the two documented
+    values -- an unmatched theme gets fully neutral phrasing, never an assumed sentiment.
+    """
+    for entry in merchant.review_themes:
+        if entry.get("theme") == theme:
+            sentiment = entry.get("sentiment")
+            return sentiment if sentiment in ("pos", "neg") else None
+    return None
+
+
+def _review_theme_emerged_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # merchant-scoped trigger, no customer_id in the real data
+    category: CategoryContext | None,  # unused: no category digest/vocab lookup needed
+) -> Opportunity | None:
+    """Qualitative customer-evidence signal, not a numeric one. Deliberately does not correlate
+    with any other trigger/metric (e.g. a concurrent perf_dip for the same merchant) -- doing so
+    would assert a causal link between review sentiment and a performance number that neither
+    payload establishes; each generator here reasons only from its own trigger's evidence, by
+    existing design (generate_opportunities() picks the single best-scoring opportunity, it never
+    merges reasoning across them).
+    """
+    if trigger.kind != "review_theme_emerged":
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    theme = payload.get("theme")
+    occurrences_raw = payload.get("occurrences_30d")
+    occurrences: float | None = occurrences_raw if isinstance(occurrences_raw, (int, float)) else None
+    common_quote_raw = payload.get("common_quote")
+    common_quote: str | None = common_quote_raw.strip() if isinstance(common_quote_raw, str) else None
+    has_quote = bool(common_quote)
+    trend = payload.get("trend")
+
+    if not isinstance(theme, str) or not theme.strip():
+        return None
+    # A theme name alone, with neither a count nor a quote, is nothing concrete to report --
+    # insufficient evidence, not a low score (same discipline as every other generator's hard
+    # gate on missing required data).
+    if occurrences is None and not has_quote:
+        return None
+
+    sentiment = _theme_sentiment(merchant, theme)
+
+    evidence_richness = 1.0 if has_quote else 0.5  # a real reviewer's own words is more concrete
+    # than a bare count -- the same "richer grounded data available" pattern every other
+    # generator's actionability/magnitude term already follows.
+    trend_signal = 1.0 if trend == "rising" else 0.6  # the one real evidenced trend value; any
+    # other value (or absence) gets the same moderate baseline other generators use for "present
+    # but not the strongest evidenced case" rather than a penalty -- this is real evidence either
+    # way, just not proven to be accelerating.
+    trigger_relevance = 1.0  # gated above: only reached with real, non-empty evidence
+    engagement_potential = 0.6  # same fixed baseline every generator in this file reuses
+
+    raw = trigger_relevance + evidence_richness + trend_signal + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    theme_readable = theme.replace("_", " ")
+    if sentiment == "pos":
+        facts = [f"customers have positively mentioned {theme_readable}"]
+    else:
+        # Both "neg" and unknown/unmatched sentiment use the same neutral phrasing --
+        # "customers are mentioning X" per the requested framing, never a complaint/blame framing
+        # and never an assumed-positive one either when sentiment genuinely isn't known.
+        facts = [f"customers have mentioned {theme_readable}"]
+    if occurrences is not None:
+        facts.append(f"{occurrences:.0f} time(s) in the last 30 days")
+    if common_quote:
+        facts.append(f'one review said: "{common_quote}"')
+    if trend == "rising":
+        facts.append("mentions have been rising")
+
+    if sentiment == "pos":
+        reason = (
+            f"Customers have positively mentioned {theme_readable} — genuine, grounded feedback "
+            f"worth acknowledging without overstating it."
+        )
+    else:
+        reason = (
+            f"Customers have mentioned {theme_readable} — worth surfacing plainly and inviting a "
+            f"conversation, without assuming a cause, a fix, or how widespread it is beyond what "
+            f"was actually reported."
+        )
+
+    return Opportunity(
+        name="review_theme_emerged",
+        action_type="review_theme_flag",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=[
+            "trigger.payload.theme",
+            "trigger.payload.occurrences_30d",
+            "trigger.payload.common_quote",
+            "trigger.payload.trend",
+            "trigger.urgency",
+            "merchant.review_themes",
+        ],
+        reason=reason,
+    )
+
+
 _GENERATORS = (
     _festival_opportunity,
     _seasonal_dip_reframe_opportunity,
     _customer_lapsed_winback_opportunity,
     _recall_due_opportunity,
     _supply_alert_opportunity,
+    _perf_spike_opportunity,
+    _milestone_reached_opportunity,
+    _competitor_opened_opportunity,
+    _renewal_due_opportunity,
+    _curious_ask_due_opportunity,
+    _perf_dip_opportunity,
+    _review_theme_emerged_opportunity,
 )
 
 
