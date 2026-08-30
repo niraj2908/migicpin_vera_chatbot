@@ -121,6 +121,24 @@ def _sanitize_fact(fact: str) -> str:
     return re.sub(r"\s{2,}", " ", stripped).strip(" ,-")
 
 
+# Category-conditioned opener for the fallback's first-message shape -- every previous message
+# shared one fixed sentence skeleton regardless of category, confirmed to be what actually ships
+# in production (Gemini quota-exhausted, TemplateComposer output byte-identical to what was
+# observed live). These five phrases are not invented: each is lifted verbatim from that
+# category's own real, documented voice.tone_examples in the seed data (categories/*.json),
+# lowercased for mid-sentence use -- e.g. dentists' own example opens "Worth a look — JIDA Oct
+# 2026 p.14"; gyms'/pharmacies' own examples both open "Quick check — ..."; restaurants'/salons'
+# own examples both open "Quick one — ...". Two categories legitimately share a phrase because
+# that is what their own real examples actually use -- not forced into artificial distinctness.
+_CATEGORY_OPENERS = {
+    "dentists": "worth a look —",
+    "gyms": "quick check —",
+    "pharmacies": "quick check —",
+    "restaurants": "quick one —",
+    "salons": "quick one —",
+}
+
+
 class TemplateComposer:
     """Deterministic, always-grounded composer. Used as the safety fallback, in tests, and as
     the default when no real provider is configured."""
@@ -145,12 +163,22 @@ class TemplateComposer:
         # first message" as a judge-penalized anti-pattern, and every /v1/reply send is by
         # construction not the first message in its conversation (see CompositionBrief.is_first_message).
         merchant_intro = f"this is {brief.merchant_name}. " if brief.customer_name and brief.is_first_message else ""
+        # First-message only, same reasoning as merchant_intro above: a reply already has its own
+        # reply_intent-driven prefix ("Great, moving ahead. " / "Noted. Coming back to this: "),
+        # and stacking a category opener on top would read as two competing framings in one
+        # message. Unknown/uncategorized category_slug (e.g. a future category not in the real
+        # dataset) falls back to no opener at all -- never a guessed or generic one.
+        opener = ""
+        if brief.is_first_message:
+            opener_phrase = _CATEGORY_OPENERS.get(brief.category_slug)
+            if opener_phrase:
+                opener = f"{opener_phrase} "
         # Generic, not curious_ask_due-specific: a fact that is itself a question (e.g. from
         # opportunity.py's _readable_question()) already ends in "?" -- appending "." unconditionally
         # would double-punctuate it ("...this week?."). Every existing generator's facts are
         # declarative and never end in "?"/"!", so this is a no-op for all of them.
         terminal = "" if fact_text.endswith(("?", "!")) else "."
-        message = f"{prefix}{subject}, {merchant_intro}{fact_text}{terminal}" + (f" {cta_text}" if cta_text else "")
+        message = f"{prefix}{subject}, {merchant_intro}{opener}{fact_text}{terminal}" + (f" {cta_text}" if cta_text else "")
         return message[: brief.max_chars]
 
 

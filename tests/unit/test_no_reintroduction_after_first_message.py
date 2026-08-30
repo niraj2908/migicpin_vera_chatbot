@@ -55,13 +55,22 @@ def test_reply_message_still_grounded_and_firewall_valid_without_the_intro() -> 
     assert "57 days" in message
 
 
-def test_merchant_facing_message_unaffected_either_way() -> None:
-    """The intro clause only ever applied to customer-facing messages (customer_name present);
-    a merchant-facing brief must render identically regardless of is_first_message."""
+def test_merchant_intro_clause_specifically_is_unaffected_by_is_first_message_for_merchant_facing() -> None:
+    """The merchant re-introduction clause only ever applied to customer-facing messages
+    (customer_name present) -- that specific clause must stay absent for a merchant-facing brief
+    regardless of is_first_message. is_first_message now ALSO gates the (separate, category-
+    opener) fallback-variety fact this file's category is "gyms" -- so the two composed messages
+    are no longer expected to be fully identical; what's asserted here is narrower and still
+    true: neither ever contains a merchant re-introduction ("this is ... ")."""
     facts = ["Diwali is 3 day(s) away"]
     first = _brief(facts, cta="open_ended", customer_name=None, send_as="vera", is_first_message=True)
     reply = _brief(facts, cta="open_ended", customer_name=None, send_as="vera", is_first_message=False)
-    assert TemplateComposer().compose(first) == TemplateComposer().compose(reply)
+    first_message = TemplateComposer().compose(first)
+    reply_message = TemplateComposer().compose(reply)
+    assert "this is " not in first_message.lower()
+    assert "this is " not in reply_message.lower()
+    assert "quick check —" in first_message  # gyms' real category opener, first-message only
+    assert "quick check —" not in reply_message
 
 
 def test_for_reply_always_sets_is_first_message_false() -> None:

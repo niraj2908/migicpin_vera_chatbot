@@ -306,6 +306,26 @@ def _customer_lapsed_winback_opportunity(
     previous_focus = payload.get("previous_focus")
 
     facts: list[str] = []
+    evidence: list[str] = [
+        "trigger.kind",
+        "trigger.payload.days_since_last_visit",
+        "trigger.payload.previous_focus",
+        "trigger.urgency",
+        "customer.consent.scope",
+        "merchant.offers",
+    ]
+    # Real field (customer.relationship.visits_total), never read by any generator until now.
+    # Fact-only enrichment, no scoring change -- same discipline the peer_stats fix already
+    # applied to milestone_reached: a real, grounded number added to composition, never a new
+    # scoring input. Omitted at 0 (or absent), matching the "never state a hollow fact" pattern
+    # already used for chronic_rx_count/total_active_members elsewhere in this file -- a
+    # customer_lapsed_hard trigger with 0 prior visits would be a contradictory data shape
+    # (the trigger's own premise is a customer who WAS visiting and stopped), not a real case to
+    # design a phrasing for.
+    visits_total = customer.visits_total
+    if visits_total is not None and visits_total > 0:
+        facts.append(f"{visits_total} visit(s) with you before this")
+        evidence.append("customer.relationship.visits_total")
     if isinstance(days_since, (int, float)):
         facts.append(f"it has been {int(days_since)} days since your last visit")
     if isinstance(previous_focus, str) and previous_focus:
@@ -321,14 +341,7 @@ def _customer_lapsed_winback_opportunity(
         score=score,
         cta="binary_yes_no" if has_offer else "open_ended",
         facts=facts,
-        evidence=[
-            "trigger.kind",
-            "trigger.payload.days_since_last_visit",
-            "trigger.payload.previous_focus",
-            "trigger.urgency",
-            "customer.consent.scope",
-            "merchant.offers",
-        ],
+        evidence=evidence,
         reason=(
             "This customer has an explicit hard-lapse trigger and has consented to winback "
             "outreach — worth a warm, no-pressure check-in rather than staying silent."
@@ -388,6 +401,21 @@ def _recall_due_opportunity(
     score = _clamp((raw / 3.6) * urgency_factor)
 
     facts: list[str] = []
+    evidence: list[str] = [
+        "trigger.kind",
+        "trigger.payload.service_due",
+        "trigger.payload.last_service_date",
+        "trigger.payload.available_slots",
+        "trigger.urgency",
+        "customer.consent.scope",
+        "merchant.offers",
+    ]
+    # Same fact-only enrichment as the sibling winback generator above -- a real, grounded
+    # number, never a scoring input, omitted when 0/absent rather than stating a hollow fact.
+    visits_total = customer.visits_total
+    if visits_total is not None and visits_total > 0:
+        facts.append(f"{visits_total} visit(s) with you before this")
+        evidence.append("customer.relationship.visits_total")
     if isinstance(service_due, str) and service_due:
         facts.append(f"your {service_due.replace('_', ' ')} recall is due")
     if isinstance(last_service_date, str) and last_service_date:
@@ -407,15 +435,7 @@ def _recall_due_opportunity(
         score=score,
         cta="multi_choice_slot" if has_slots else "open_ended",
         facts=facts,
-        evidence=[
-            "trigger.kind",
-            "trigger.payload.service_due",
-            "trigger.payload.last_service_date",
-            "trigger.payload.available_slots",
-            "trigger.urgency",
-            "customer.consent.scope",
-            "merchant.offers",
-        ],
+        evidence=evidence,
         reason=(
             "This customer's recall window has opened and they've consented to recall "
             "reminders — worth offering real available slots rather than a generic nudge."

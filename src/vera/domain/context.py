@@ -159,6 +159,16 @@ class CustomerContext:
         scope = consent.get("scope", []) if isinstance(consent, dict) else []
         return [str(s) for s in scope]
 
+    @property
+    def visits_total(self) -> int | None:
+        # Real field (challenge-testing-brief.md SS3.3: relationship.visits_total), present on
+        # every real seed customer but never read anywhere until now -- Optional rather than a
+        # default of 0, matching the same "0 would falsely claim a fact" discipline
+        # MerchantContext.total_active_members already uses.
+        relationship = self.raw.get("relationship", {})
+        count = relationship.get("visits_total") if isinstance(relationship, dict) else None
+        return int(count) if isinstance(count, (int, float)) else None
+
 
 @dataclass(frozen=True)
 class TriggerContext:

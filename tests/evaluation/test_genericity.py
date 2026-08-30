@@ -102,15 +102,15 @@ def test_festival_change_alone_updates_the_message() -> None:
     assert "Holi" in message_holi and "Holi" not in message_diwali
 
 
-def test_template_composer_wording_is_not_yet_category_flavored_known_limitation() -> None:
-    """Characterization test, not a pass/fail quality gate: TemplateComposer's compose() reads
-    only merchant_name/owner_first_name/facts/cta — it never touches voice_tone or vocab_allowed,
-    so its sentence *structure* is identical across categories even though the facts inside it
-    differ. This is an honest, evidence-based known limitation (see the evaluation report), left
-    unfixed in this pass because a safe, natural-sounding category-specific canned phrase set is
-    a real design question, not a one-line patch — rushing it risks producing awkward or
-    wrong-register fallback text, which is worse than plain-but-safe wording.
-    """
+def test_template_composer_first_message_wording_now_varies_by_category() -> None:
+    """Supersedes the prior characterization test of the same limitation this test's own
+    docstring predicted: TemplateComposer's fallback shape used to be category-blind (facts
+    varied, sentence structure never did) -- production evidence (Gemini quota-exhausted, the
+    fallback is what actually ships) made this the highest-ROI fix available. Each category now
+    gets a real, evidence-grounded opener phrase reused verbatim from that category's own
+    documented voice.tone_examples (categories/*.json) -- restaurants/salons both say "quick
+    one —" and dentists says "worth a look —" because that's what their own real examples say,
+    not because a distinct phrase was forced onto every category."""
     from vera.generation.brief import CompositionBrief
 
     facts = ["Diwali is 3 day(s) away", "20% off"]
@@ -130,9 +130,9 @@ def test_template_composer_wording_is_not_yet_category_flavored_known_limitation
     restaurant_message = _COMPOSER.compose(restaurant_brief)
     dentist_message = _COMPOSER.compose(dentist_brief)
 
+    assert "quick one —" in restaurant_message
+    assert "worth a look —" in dentist_message
+
     restaurant_shape = restaurant_message.replace("Suresh", "X").replace("Test Restaurant", "X")
     dentist_shape = dentist_message.replace("Meera", "X").replace("Test Clinic", "X")
-    assert restaurant_shape == dentist_shape, (
-        "if this fails, TemplateComposer has started varying by category — update this "
-        "characterization test and remove the known-limitation note in the report"
-    )
+    assert restaurant_shape != dentist_shape
