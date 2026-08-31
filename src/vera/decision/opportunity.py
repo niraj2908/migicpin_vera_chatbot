@@ -1119,6 +1119,278 @@ def _review_theme_emerged_opportunity(
     )
 
 
+# Digest-item-backed generators (research_digest, regulation_change): both trigger kinds carry
+# only {category, top_item_id} (+ regulation_change's own deadline_iso) in their payload -- the
+# actual research/compliance content lives in CategoryContext.digest_item(), an accessor that
+# already existed (built for seasonal_perf_dip's own digest lookup) before either of these two
+# generators. Both hard-gate on the resolved item's own "kind" field matching the real digest
+# shape for that trigger kind (dentists.json: "research" items carry trial_n/patient_segment,
+# "compliance" items don't) -- confirmed against the real seed data, not assumed -- so a
+# mismatched/adversarial top_item_id pointing at the wrong kind of digest item is never composed
+# into a message.
+_RESEARCH_DIGEST_KIND = "research"
+_REGULATION_CHANGE_DIGEST_KIND = "compliance"
+
+
+def _resolve_digest_item(
+    merchant: MerchantContext, trigger: TriggerContext, category: CategoryContext | None
+) -> dict[str, Any] | None:
+    payload: dict[str, Any] = trigger.payload
+    item_category = payload.get("category")
+    top_item_id = payload.get("top_item_id")
+    if not isinstance(item_category, str) or not item_category:
+        return None
+    if not isinstance(top_item_id, str) or not top_item_id:
+        return None
+    # The trigger's own declared category must match the merchant it was pushed for -- a digest
+    # item curated for a different vertical (e.g. a dentists item reaching a pharmacies merchant)
+    # is not grounded content for this merchant, the same category-mismatch discipline
+    # festival_upcoming's category_relevance check already applies.
+    if item_category != merchant.category_slug:
+        return None
+    if category is None:
+        return None
+    return category.digest_item(top_item_id)
+
+
+def _research_digest_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # unused: merchant-scoped, no customer_id in the real data
+    category: CategoryContext | None,
+) -> Opportunity | None:
+    if trigger.kind != "research_digest":
+        return None
+
+    item = _resolve_digest_item(merchant, trigger, category)
+    if item is None or item.get("kind") != _RESEARCH_DIGEST_KIND:
+        return None
+
+    title = item.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+
+    source = item.get("source")
+    trial_n = item.get("trial_n")
+    patient_segment = item.get("patient_segment")
+    actionable = item.get("actionable")
+    has_trial_data = isinstance(trial_n, (int, float))
+    has_actionable = isinstance(actionable, str) and bool(actionable.strip())
+
+    trigger_relevance = 1.0  # gated above: only reached with a real, kind-matched digest item
+    specificity_signal = 1.0 if has_trial_data else 0.6  # a real trial size is stronger, more
+    # concrete evidence than a bare title -- same "richer grounded data available" pattern
+    # review_theme_emerged's evidence_richness term already uses.
+    actionability = 1.0 if has_actionable else 0.5
+    engagement_potential = 0.6  # same fixed baseline every generator in this file reuses
+
+    raw = trigger_relevance + specificity_signal + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    facts = [title]
+    evidence = [
+        "trigger.payload.category",
+        "trigger.payload.top_item_id",
+        "category.digest.title",
+        "trigger.urgency",
+        "merchant.category_slug",
+    ]
+    if has_trial_data:
+        segment_text = (
+            f" ({str(patient_segment).replace('_', ' ')})"
+            if isinstance(patient_segment, str) and patient_segment
+            else ""
+        )
+        facts.append(f"{trial_n:.0f}-patient trial{segment_text}")
+        evidence.append("category.digest.trial_n")
+        if segment_text:
+            evidence.append("category.digest.patient_segment")
+    if isinstance(source, str) and source:
+        facts.append(f"source: {source}")
+        evidence.append("category.digest.source")
+    if has_actionable:
+        facts.append(f"suggested action: {actionable}")
+        evidence.append("category.digest.actionable")
+
+    return Opportunity(
+        name=f"research_digest:{item.get('id', '')}",
+        action_type="research_digest_share",
+        score=score,
+        cta="binary_yes_no",
+        facts=facts,
+        evidence=evidence,
+        reason=(
+            "A real, category-matched research item is in this week's digest — worth sharing "
+            "since it's directly relevant to this merchant's own category, not a generic pitch."
+        ),
+    )
+
+
+def _regulation_change_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,  # unused: merchant-scoped, no customer_id in the real data
+    category: CategoryContext | None,
+) -> Opportunity | None:
+    if trigger.kind != "regulation_change":
+        return None
+
+    item = _resolve_digest_item(merchant, trigger, category)
+    if item is None or item.get("kind") != _REGULATION_CHANGE_DIGEST_KIND:
+        return None
+
+    title = item.get("title")
+    deadline_iso = trigger.payload.get("deadline_iso")
+    # A compliance claim with no title (nothing to cite) or no deadline (nothing to state as the
+    # effective date) is not grounded enough to send -- hard gate, matching this file's
+    # "insufficient evidence, not a low score" convention. Deliberately never falls back to
+    # trigger.expires_at for the deadline claim itself: expires_at is when WE stop treating the
+    # trigger as fresh, not a sourced statement about the regulation's own effective date -- they
+    # happen to be equal in the one real seed instance, but that's the data pipeline's choice, not
+    # something this generator is entitled to assume in general.
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if not isinstance(deadline_iso, str) or not deadline_iso.strip():
+        return None
+
+    source = item.get("source")
+    actionable = item.get("actionable")
+    has_actionable = isinstance(actionable, str) and bool(actionable.strip())
+
+    trigger_relevance = 1.0  # gated above: only reached with a real, kind-matched digest item and a real deadline
+    actionability = 1.0 if has_actionable else 0.5
+    engagement_potential = 0.6  # same fixed baseline every generator in this file reuses
+
+    raw = trigger_relevance + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 2.6) * urgency_factor)
+
+    facts = [title, f"deadline: {deadline_iso}"]
+    evidence = [
+        "trigger.payload.category",
+        "trigger.payload.top_item_id",
+        "trigger.payload.deadline_iso",
+        "category.digest.title",
+        "trigger.urgency",
+        "merchant.category_slug",
+    ]
+    if isinstance(source, str) and source:
+        facts.append(f"source: {source}")
+        evidence.append("category.digest.source")
+    if has_actionable:
+        facts.append(f"suggested action: {actionable}")
+        evidence.append("category.digest.actionable")
+
+    return Opportunity(
+        name=f"regulation_change:{item.get('id', '')}",
+        action_type="regulatory_compliance_alert",
+        score=score,
+        cta="open_ended",
+        facts=facts,
+        evidence=evidence,
+        reason=(
+            "A real, sourced regulatory change with a stated deadline affects this merchant's "
+            "category — informational, not legal advice, but worth surfacing plainly rather "
+            "than staying silent until the deadline is closer or already passed."
+        ),
+    )
+
+
+# Per the real seed customer record (c_013_grandfather_for_m009): consent.scope includes
+# "refill_reminders" -- the exact scope this trigger kind requires, not an invented category.
+_CHRONIC_REFILL_CONSENT_SCOPE = "refill_reminders"
+
+
+def _chronic_refill_due_opportunity(
+    merchant: MerchantContext,
+    trigger: TriggerContext,
+    customer: CustomerContext | None,
+    category: CategoryContext | None,  # unused: no category digest/vocab lookup needed for this decision
+) -> Opportunity | None:
+    """Customer-scoped and consent-gated, same discipline as recall_due/customer_lapsed_hard.
+    Deliberately never reads customer.raw beyond the consent scope: chronic_conditions
+    (diagnosis-shaped data) lives on the real customer record but is never surfaced here or
+    anywhere in this file -- only trigger.payload.molecule_list (the medications actually up for
+    refill) is ever stated, never an inferred diagnosis from what those medications treat. This is
+    the same molecule-name-as-grounded-fact pattern _supply_alert_opportunity already uses, stated
+    here TO the customer about their own prescriptions on file, not to a third party.
+    """
+    if trigger.kind != "chronic_refill_due":
+        return None
+
+    if customer is None:
+        return None
+    if _CHRONIC_REFILL_CONSENT_SCOPE not in customer.consent_scope:
+        return None
+
+    payload: dict[str, Any] = trigger.payload
+    molecule_list_raw = payload.get("molecule_list")
+    molecules = (
+        [str(m) for m in molecule_list_raw if isinstance(m, str) and m]
+        if isinstance(molecule_list_raw, list)
+        else []
+    )
+    # The core substantive evidence: with no real molecule names there is nothing grounded to say
+    # at all -- same "insufficient evidence, not a low score" hard gate every other generator in
+    # this file applies to its own required field. The trigger's own existence is trusted as the
+    # judge/data pipeline's classification that a refill is genuinely due (same discipline
+    # recall_due/customer_lapsed_hard already apply to their own kind), so no days-until-empty
+    # math is re-derived here.
+    if not molecules:
+        return None
+
+    last_refill = payload.get("last_refill")
+    stock_runs_out_iso = payload.get("stock_runs_out_iso")
+    delivery_address_saved = payload.get("delivery_address_saved") is True
+    has_run_out_date = isinstance(stock_runs_out_iso, str) and bool(stock_runs_out_iso)
+
+    trigger_relevance = 1.0
+    specificity_signal = 1.0 if has_run_out_date else 0.6
+    actionability = 1.0 if delivery_address_saved else 0.5
+    engagement_potential = 0.6  # same fixed baseline every generator in this file reuses
+
+    raw = trigger_relevance + specificity_signal + actionability + engagement_potential
+    urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
+    score = _clamp((raw / 3.6) * urgency_factor)
+
+    facts = [f"{', '.join(molecules)} due for refill"]
+    evidence = [
+        "trigger.kind",
+        "trigger.payload.molecule_list",
+        "trigger.payload.last_refill",
+        "trigger.payload.stock_runs_out_iso",
+        "trigger.payload.delivery_address_saved",
+        "trigger.urgency",
+        "customer.consent.scope",
+        "merchant.offers",
+    ]
+    if isinstance(last_refill, str) and last_refill:
+        facts.append(f"last refilled on {last_refill}")
+    if isinstance(stock_runs_out_iso, str) and stock_runs_out_iso:
+        facts.append(f"supply runs out on {stock_runs_out_iso.split('T')[0]}")
+    if delivery_address_saved:
+        facts.append("home delivery address already on file")
+    for offer in merchant.active_offers:
+        offer_title = offer.get("title")
+        if offer_title:
+            facts.append(str(offer_title))
+
+    return Opportunity(
+        name=f"chronic_refill:{customer.customer_id}",
+        action_type="chronic_refill_reminder",
+        score=score,
+        cta="binary_confirm_cancel" if delivery_address_saved else "open_ended",
+        facts=facts,
+        evidence=evidence,
+        reason=(
+            "This customer's chronic medications are due for refill and they've consented to "
+            "refill reminders — worth a clear, respectful heads-up using only the medications "
+            "and delivery details actually on file, no inferred diagnosis or invented urgency."
+        ),
+    )
+
+
 _GENERATORS = (
     _festival_opportunity,
     _seasonal_dip_reframe_opportunity,
@@ -1132,6 +1404,9 @@ _GENERATORS = (
     _curious_ask_due_opportunity,
     _perf_dip_opportunity,
     _review_theme_emerged_opportunity,
+    _research_digest_opportunity,
+    _regulation_change_opportunity,
+    _chronic_refill_due_opportunity,
 )
 
 
