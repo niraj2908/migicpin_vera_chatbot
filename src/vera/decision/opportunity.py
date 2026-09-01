@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -7,6 +8,44 @@ from vera.domain.context import CategoryContext, CustomerContext, MerchantContex
 #                     + engagement_potential) / MAX_RAW_SCORE, then scaled by urgency_factor.
 MAX_RAW_SCORE = 5.0
 TIMELINESS_WINDOW_DAYS = 14
+
+# Canonical definitions -- vera/generation/firewall.py imports these FROM here (not the reverse:
+# firewall.py already transitively depends on this module via brief.py -> compiler.py ->
+# opportunity.py, so opportunity.py importing from firewall.py would be a circular import; this
+# module has no dependency on the generation layer, so this direction is clean). Never duplicate
+# these patterns elsewhere -- both _strip_numeric_claims() below and firewall.validate()'s own
+# provenance check must agree on exactly what a "percentage"/"price" shape means.
+PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+CURRENCY_RE = re.compile(r"₹\s*(\d[\d,]*(?:\.\d+)?)")
+
+
+def _strip_numeric_claims(value: object) -> str:
+    """Accepts `object`, not `str`, deliberately: several call sites' own upstream gates only
+    check `is None`/truthiness (matching this file's existing convention of tolerating whatever
+    an f-string would already have accepted), not `isinstance(..., str)` -- coercing via `str()`
+    here, once, is safer than auditing/tightening every caller's own gate just for this.
+
+    P1 fix (hostile judge-simulation finding): firewall.validate()'s percentage/price check
+    treats ANY %/₹ figure appearing anywhere in `facts_allowed` as legitimate evidence for the
+    whole message -- it has no way to know a given figure came from a value this codebase itself
+    computed (e.g. `delta_pct*100`) versus one embedded inside an untrusted free-text field a
+    generator merely echoed. Reproduced directly: trigger.payload.metric = "calls (actually down
+    99% not 50%)" made the fabricated 99% render verbatim while firewall.validate() reported
+    `ok: True`, because the fake figure was already sitting inside facts_allowed by the time the
+    check ran, satisfying its own provenance requirement by construction.
+
+    Applied ONLY to fields whose own legitimate content is a name/label/category/quote/date --
+    never one meant to carry a real numeric claim in the first place, so nothing genuine is ever
+    lost. Deliberately NOT applied to category.digest.{title,summary,actionable,source} or
+    merchant.offers[].title: those fields' entire legitimate purpose IS to state a real, curated
+    numeric claim (the flagship "38% lower caries recurrence" research figure; a real "Dental
+    Cleaning @ ₹299" offer) -- stripping them would destroy exactly the grounded content the
+    digest-summary enrichment and offer facts exist to surface. Reuses firewall.py's own
+    PERCENT_RE/CURRENCY_RE (never duplicated) -- the same patterns the firewall itself checks
+    the final message against, so what gets stripped here is defined in exactly one place."""
+    stripped = PERCENT_RE.sub("", str(value))
+    stripped = CURRENCY_RE.sub("", stripped)
+    return re.sub(r"\s{2,}", " ", stripped).strip(" ,-")
 
 # Long-content safety valve for digest-backed generators (research_digest, regulation_change,
 # seasonal_perf_dip): TemplateComposer's fallback naively slices its composed message to
@@ -184,7 +223,7 @@ def _festival_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / MAX_RAW_SCORE) * urgency_factor)
 
-    facts = [f"{festival} is {days_until} day(s) away"]
+    facts = [f"{_strip_numeric_claims(festival)} is {days_until} day(s) away"]
     for offer in active_offers:
         title = offer.get("title")
         if title:
@@ -260,7 +299,7 @@ def _seasonal_dip_reframe_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 4.0) * urgency_factor)
 
-    facts = [f"{metric} down {abs(delta_pct) * 100:.0f}% this week"]
+    facts = [f"{_strip_numeric_claims(metric)} down {abs(delta_pct) * 100:.0f}% this week"]
     evidence = [
         "trigger.payload.metric",
         "trigger.payload.delta_pct",
@@ -379,7 +418,7 @@ def _customer_lapsed_winback_opportunity(
     if isinstance(days_since, (int, float)):
         facts.append(f"it has been {int(days_since)} days since your last visit")
     if isinstance(previous_focus, str) and previous_focus:
-        facts.append(f"your previous focus was {previous_focus.replace('_', ' ')}")
+        facts.append(f"your previous focus was {_strip_numeric_claims(previous_focus.replace('_', ' '))}")
     for offer in active_offers:
         title = offer.get("title")
         if title:
@@ -467,13 +506,13 @@ def _recall_due_opportunity(
         facts.append(f"{visits_total} visit(s) with you before this")
         evidence.append("customer.relationship.visits_total")
     if isinstance(service_due, str) and service_due:
-        facts.append(f"your {service_due.replace('_', ' ')} recall is due")
+        facts.append(f"your {_strip_numeric_claims(service_due.replace('_', ' '))} recall is due")
     if isinstance(last_service_date, str) and last_service_date:
         facts.append(f"your last visit was on {last_service_date}")
     if isinstance(due_date, str) and due_date:
         facts.append(f"your recall is due by {due_date}")
     for label in slot_labels:
-        facts.append(f"available slot: {label}")
+        facts.append(f"available slot: {_strip_numeric_claims(label)}")
     for offer in active_offers:
         title = offer.get("title")
         if title:
@@ -517,7 +556,26 @@ def _already_discussed_in_conversation_history(merchant: MerchantContext, molecu
     in one request, and no purely structural check on its content can fully rule out a more
     elaborate two-sided fabrication -- that is an architectural limit of trusting judge-supplied
     historical context at all, not something this fix can close further without inventing a
-    verification mechanism the contract does not provide."""
+    verification mechanism the contract does not provide.
+
+    P1 #3 fix (hostile judge-simulation finding, one level deeper): the original "other side"
+    check accepted ANY `from` value that wasn't literally `None`/`"vera"` -- including empty
+    strings, "unknown", case-variant/lookalike forgeries ("Vera", "MERCHANT"), and pure garbage
+    ("xXx_not_a_real_role_xXx") -- reopening the exact suppression-bypass class the fix above
+    was built to close, just one field-value away. Reproduced directly: a single forged
+    `{"from": "xXx_not_a_real_role_xXx", ...}` entry alongside a genuine "vera" mention was
+    sufficient to suppress a fresh, otherwise-fully-justified compliance alert.
+
+    Fixed by requiring the literal, exact counterpart role "merchant" -- not an invented value:
+    a direct scan of the real seed dataset (merchants_seed.json) confirms "vera" and "merchant"
+    are the ONLY two `from` values that ever appear in real conversation_history data; "customer"
+    never appears there (this field is documented as the merchant's own thread with Vera, not a
+    mixed merchant+customer one -- supply_alert itself is always merchant-scoped, trigger.
+    customer_id is null in every real instance). Still not a claim of cryptographic
+    unforgeability -- the judge can still fabricate a `"from": "merchant"` entry verbatim, same
+    architectural limit as before -- but a forged/garbage/case-variant role can no longer stand
+    in for it, closing the gap this audit actually found without inventing new trust the contract
+    doesn't provide."""
     molecule_lower = molecule.lower()
     vera_mentioned_it = any(
         entry.get("from") == "vera" and molecule_lower in str(entry.get("body", "")).lower()
@@ -525,9 +583,7 @@ def _already_discussed_in_conversation_history(merchant: MerchantContext, molecu
     )
     if not vera_mentioned_it:
         return False
-    other_side_responded = any(
-        entry.get("from") not in (None, "vera") for entry in merchant.conversation_history
-    )
+    other_side_responded = any(entry.get("from") == "merchant" for entry in merchant.conversation_history)
     return other_side_responded
 
 
@@ -566,11 +622,12 @@ def _supply_alert_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 2.6) * urgency_factor)
 
-    facts = [f"voluntary recall on {molecule}"]
+    facts = [f"voluntary recall on {_strip_numeric_claims(molecule)}"]
     if isinstance(affected_batches, list) and affected_batches:
-        facts.append(f"affected batches: {', '.join(str(b) for b in affected_batches)}")
+        clean_batches = ", ".join(_strip_numeric_claims(str(b)) for b in affected_batches)
+        facts.append(f"affected batches: {clean_batches}")
     if isinstance(manufacturer, str) and manufacturer:
-        facts.append(f"manufacturer {manufacturer}")
+        facts.append(f"manufacturer {_strip_numeric_claims(manufacturer)}")
     if chronic_rx_count:  # a count of exactly 0 has nothing informative to state — omit, don't
         # claim "0 chronic-Rx customers on file", which reads as an odd non-fact rather than
         # useful context (same reasoning as omitting an offer fact when there are no active offers).
@@ -642,11 +699,11 @@ def _perf_spike_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 3.6) * urgency_factor)
 
-    facts = [f"{metric} up {delta_pct * 100:.0f}% this week"]
+    facts = [f"{_strip_numeric_claims(metric)} up {delta_pct * 100:.0f}% this week"]
     if isinstance(vs_baseline, (int, float)):
         facts.append(f"vs a baseline of {vs_baseline}")
     if isinstance(likely_driver, str) and likely_driver:
-        facts.append(f"likely driver: {likely_driver.replace('_', ' ')}")
+        facts.append(f"likely driver: {_strip_numeric_claims(likely_driver.replace('_', ' '))}")
     for offer in active_offers:
         title = offer.get("title")
         if title:
@@ -713,7 +770,7 @@ def _milestone_reached_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 3.6) * urgency_factor)
 
-    metric_readable = metric.replace("_", " ")
+    metric_readable = _strip_numeric_claims(metric.replace("_", " "))
     if already_crossed:
         facts = [f"{metric_readable}: {value_now:.0f}, past the {milestone_value:.0f} milestone"]
     else:
@@ -746,7 +803,8 @@ def _milestone_reached_opportunity(
         if peer_avg is not None and value_now >= peer_avg:
             scope_label = category.peer_stats_scope
             if scope_label:
-                facts.append(f"peer average for {scope_label.replace('_', ' ')} is {peer_avg:.0f} reviews")
+                clean_scope = _strip_numeric_claims(scope_label.replace("_", " "))
+                facts.append(f"peer average for {clean_scope} is {peer_avg:.0f} reviews")
             else:
                 facts.append(f"peer average is {peer_avg:.0f} reviews")
             evidence.append("category.peer_stats.avg_review_count")
@@ -821,7 +879,10 @@ def _competitor_opened_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 3.6) * urgency_factor)
 
-    facts = [f"{competitor_name} opened {distance_km:g}km away"]
+    # competitor_name is sanitized (a business name is never legitimately a %/price claim);
+    # their_offer is NOT -- its own real value, like a merchant's own offer title, IS meant to
+    # state a real price (the real seed example: "Dental Cleaning @ ₹199").
+    facts = [f"{_strip_numeric_claims(competitor_name)} opened {distance_km:g}km away"]
     if isinstance(opened_date, str) and opened_date:
         facts.append(f"opened {opened_date}")
     if isinstance(their_offer, str) and their_offer:
@@ -881,7 +942,7 @@ def _renewal_due_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 2.6) * urgency_factor)
 
-    facts = [f"{plan} plan renews in {days_remaining:.0f} day(s)"]
+    facts = [f"{_strip_numeric_claims(plan)} plan renews in {days_remaining:.0f} day(s)"]
     if isinstance(renewal_amount, (int, float)):
         facts.append(f"renewal amount ₹{renewal_amount:g}")
 
@@ -911,7 +972,7 @@ def _readable_question(ask_template: str) -> str:
     ask_template value the judge might push, not just the one seen in the seed data, so it does
     nothing smarter than de-slug + capitalize + ensure a trailing '?' -- the same discipline
     already used for trigger.payload.previous_focus elsewhere in this file."""
-    words = ask_template.replace("_", " ").strip()
+    words = _strip_numeric_claims(ask_template.replace("_", " ")).strip()
     if not words:
         return words
     text = words[0].upper() + words[1:]
@@ -1033,7 +1094,7 @@ def _perf_dip_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 3.6) * urgency_factor)
 
-    facts = [f"{metric} down {abs(delta_pct) * 100:.0f}% this week"]
+    facts = [f"{_strip_numeric_claims(metric)} down {abs(delta_pct) * 100:.0f}% this week"]
     if has_baseline:
         facts.append(f"vs a baseline of {vs_baseline}")
 
@@ -1124,7 +1185,7 @@ def _review_theme_emerged_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 3.6) * urgency_factor)
 
-    theme_readable = theme.replace("_", " ")
+    theme_readable = _strip_numeric_claims(theme.replace("_", " "))
     if sentiment == "pos":
         facts = [f"customers have positively mentioned {theme_readable}"]
     else:
@@ -1135,7 +1196,11 @@ def _review_theme_emerged_opportunity(
     if occurrences is not None:
         facts.append(f"{occurrences:.0f} time(s) in the last 30 days")
     if common_quote:
-        facts.append(f'one review said: "{common_quote}"')
+        # A real customer's own words, quoted verbatim -- except %/price patterns specifically:
+        # the firewall's "allowed" set is global across the whole message, not scoped to inside
+        # this quote, so a fabricated %/₹ hidden in an injected quote would otherwise become
+        # usable "evidence" for an unrelated claim anywhere else in the message.
+        facts.append(f'one review said: "{_strip_numeric_claims(common_quote)}"')
     if trend == "rising":
         facts.append("mentions have been rising")
 
@@ -1393,7 +1458,7 @@ def _chronic_refill_due_opportunity(
     payload: dict[str, Any] = trigger.payload
     molecule_list_raw = payload.get("molecule_list")
     molecules = (
-        [str(m) for m in molecule_list_raw if isinstance(m, str) and m]
+        [clean for m in molecule_list_raw if isinstance(m, str) and m and (clean := _strip_numeric_claims(m))]
         if isinstance(molecule_list_raw, list)
         else []
     )

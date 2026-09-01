@@ -1,9 +1,16 @@
 import re
 
+from vera.decision.opportunity import CURRENCY_RE, PERCENT_RE
 from vera.generation.brief import CompositionBrief
 
-_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
-_CURRENCY_RE = re.compile(r"₹\s*(\d[\d,]*(?:\.\d+)?)")
+# PERCENT_RE/CURRENCY_RE now live in opportunity.py, not here: opportunity.py's own
+# _strip_numeric_claims() (P1 fix -- see its docstring) needs them to strip a fabricated %/price
+# claim out of an untrusted free-text field BEFORE it can ever reach facts_allowed, and
+# opportunity.py cannot import them from this module -- firewall.py already transitively depends
+# on opportunity.py (firewall -> brief -> compiler -> opportunity), so the reverse import would
+# be circular. opportunity.py has no dependency on this module, so this direction is clean.
+# Still the single source of truth for what a "percentage"/"price" shape means anywhere in this
+# codebase; never duplicate them.
 # A scheme/www-prefixed token (matched greedily to the next whitespace, so substitution removes
 # the whole URL, not just the "https://" prefix), OR a bare domain-shaped token with a
 # recognizable TLD and optional path — e.g. "evil.example/promo" has no scheme and no "www." but
@@ -118,14 +125,14 @@ def validate(message: str, brief: CompositionBrief) -> tuple[bool, list[str]]:
     if _PLACEHOLDER_RE.search(message):
         reasons.append("message contains an unresolved template placeholder")
 
-    allowed_percentages = _fact_numbers(brief.facts, _PERCENT_RE)
-    claimed_percentages = set(_PERCENT_RE.findall(message))
+    allowed_percentages = _fact_numbers(brief.facts, PERCENT_RE)
+    claimed_percentages = set(PERCENT_RE.findall(message))
     unsupported_percentages = claimed_percentages - allowed_percentages
     if unsupported_percentages:
         reasons.append(f"unsupported percentage claim(s): {sorted(unsupported_percentages)}")
 
-    allowed_prices = _fact_numbers(brief.facts, _CURRENCY_RE)
-    claimed_prices = set(_CURRENCY_RE.findall(message))
+    allowed_prices = _fact_numbers(brief.facts, CURRENCY_RE)
+    claimed_prices = set(CURRENCY_RE.findall(message))
     unsupported_prices = claimed_prices - allowed_prices
     if unsupported_prices:
         reasons.append(f"unsupported price claim(s): {sorted(unsupported_prices)}")

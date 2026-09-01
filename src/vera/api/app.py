@@ -317,7 +317,18 @@ def reply(body: ReplyRequest) -> dict[str, Any]:
     # mutate, compose) without blocking replies on any other conversation — see
     # ConversationStore.turn_lock's docstring for the concrete misclassification bug this closes.
     with store.conversations.turn_lock(body.conversation_id):
-        if conv.status != "active":
+        # Only "ended" is a terminal state that blocks further processing. "waiting" is NOT
+        # terminal -- it means Vera backed off once after detecting what looked like an
+        # auto-reply, still expecting a real reply later (challenge-brief.md's own named pain
+        # point: auto-reply handling that "burns 2-3 turns"). Gating on `!= "active"` here
+        # meant every turn after that single backoff was unconditionally short-circuited to
+        # "end" without ever re-classifying the new incoming message -- so a merchant who
+        # replied to the auto-reply with genuine engagement ("yes very interested, tell me
+        # more") got silently dropped, even though decide_reply() already takes
+        # auto_reply_hits_so_far specifically to make this exact call correctly (still an
+        # auto-reply -> end; genuinely different -> send). Reproduced identically on local and
+        # production before this fix. The fix is exactly this condition: block on "ended" only.
+        if conv.status == "ended":
             reason = f"conversation already {conv.status}"
             log_event("reply_rejected", conversation_id=body.conversation_id, reason=reason)
             return {"action": "end", "rationale": reason}
