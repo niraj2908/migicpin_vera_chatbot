@@ -8,6 +8,45 @@ from vera.domain.context import CategoryContext, CustomerContext, MerchantContex
 MAX_RAW_SCORE = 5.0
 TIMELINESS_WINDOW_DAYS = 14
 
+# Long-content safety valve for digest-backed generators (research_digest, regulation_change,
+# seasonal_perf_dip): TemplateComposer's fallback naively slices its composed message to
+# brief.max_chars (400) -- inserting a real digest item's full verbatim `summary` text (curated
+# source content, observed 100-250 chars in the real category data) on top of an already-
+# populated fact list can push the total past that budget, and a naive slice then lands mid-
+# sentence inside the summary itself (confirmed empirically: "...flagged hig" on the real JIDA
+# case). These generators are instructed to state `summary` verbatim or not at all, never a
+# truncated/altered version of it -- so it is included only when the full text safely fits
+# alongside every other fact already selected, omitted (never truncated) otherwise. This is the
+# same "omit rather than corrupt a fact" discipline already applied everywhere else in this file
+# to missing/malformed data, extended to the "too long to include intact" case. 340 leaves
+# comfortable headroom below 400 for the fixed prefix/subject/opener/CTA text and "; "-join
+# overhead that surrounds the fact list (observed ~50-60 chars on real messages).
+_SAFE_FACT_TEXT_BUDGET = 340
+
+
+def _insert_summary_if_it_fits(
+    facts: list[str], evidence: list[str], summary: object, insert_index: int
+) -> None:
+    """Inserted right after the fact it belongs to (the digest item's own title) where possible,
+    not appended last -- reads more naturally (headline claim, then supporting detail) than
+    trailing an unrelated fact like "suggested action". Insertion position alone doesn't
+    guarantee summary never ends up last, though (e.g. no offers/member-count facts follow it):
+    summary text is real curated prose that already ends in its own period, and TemplateComposer
+    unconditionally appends its own terminal "." to whatever fact ends the list -- confirmed
+    empirically to otherwise produce a double period ("...unaffected.."). A single trailing
+    period is stripped here for exactly that reason -- the same "don't duplicate terminal
+    punctuation" convention TemplateComposer already applies for facts ending in "?"/"!", applied
+    on the fact-construction side since this generator can't touch shared composer code. This
+    changes no word of the supplied text, only a single redundant punctuation mark; the full
+    verbatim sentence is otherwise preserved exactly."""
+    if not isinstance(summary, str) or not summary.strip():
+        return
+    candidate = summary.strip().removesuffix(".")
+    projected = "; ".join([*facts, candidate])
+    if len(projected) <= _SAFE_FACT_TEXT_BUDGET:
+        facts.insert(insert_index, candidate)
+        evidence.append("category.digest.summary")
+
 # trigger.urgency (1-5) is documented (engagement-design.md's TriggerContext section) as ranking
 # a trigger "against other queued triggers" — a judge/data-declared priority, distinct from the
 # payload's own timing. Every festival_upcoming trigger in the base dataset sits at urgency=1
@@ -222,12 +261,25 @@ def _seasonal_dip_reframe_opportunity(
     score = _clamp((raw / 4.0) * urgency_factor)
 
     facts = [f"{metric} down {abs(delta_pct) * 100:.0f}% this week"]
+    evidence = [
+        "trigger.payload.metric",
+        "trigger.payload.delta_pct",
+        "trigger.payload.is_expected_seasonal",
+        "trigger.urgency",
+        "category.digest",
+        "merchant.customer_aggregate.total_active_members",
+        "merchant.offers",
+    ]
+    seasonal_summary: object = None
+    summary_insert_index = len(facts)  # default: right after the dip fact if no digest title exists
     if seasonal_digest:
         item = seasonal_digest[0]
         title = item.get("title")
         source = item.get("source")
         if title:
             facts.append(f"{title}" + (f" ({source})" if source else ""))
+            summary_insert_index = len(facts)  # right after the digest title fact
+        seasonal_summary = item.get("summary")
     member_count = merchant.total_active_members
     if member_count is not None:
         facts.append(f"{member_count} active members")
@@ -235,6 +287,12 @@ def _seasonal_dip_reframe_opportunity(
         title = offer.get("title")
         if title:
             facts.append(str(title))
+    # Opportunity #1: the seasonal digest item's own `summary` carries the real business-
+    # calendar insight (e.g. "Most gyms over-spend on ads now; underspend in October") the title
+    # alone doesn't state -- verbatim only, never paraphrased. Inserted right after the digest
+    # title fact and only if it still fits -- see _insert_summary_if_it_fits()'s docstring.
+    # Fact-only enrichment: digest_support above (the scoring term) is unchanged either way.
+    _insert_summary_if_it_fits(facts, evidence, seasonal_summary, summary_insert_index)
 
     return Opportunity(
         name="seasonal_dip_reframe",
@@ -242,15 +300,7 @@ def _seasonal_dip_reframe_opportunity(
         score=score,
         cta="open_ended",
         facts=facts,
-        evidence=[
-            "trigger.payload.metric",
-            "trigger.payload.delta_pct",
-            "trigger.payload.is_expected_seasonal",
-            "trigger.urgency",
-            "category.digest",
-            "merchant.customer_aggregate.total_active_members",
-            "merchant.offers",
-        ],
+        evidence=evidence,
         reason=(
             f"{metric} is down {abs(delta_pct) * 100:.0f}% but the trigger marks this as an "
             f"expected seasonal pattern, not a real problem — worth reassuring the merchant "
@@ -1188,6 +1238,8 @@ def _research_digest_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 3.6) * urgency_factor)
 
+    summary = item.get("summary")
+
     facts = [title]
     evidence = [
         "trigger.payload.category",
@@ -1212,6 +1264,13 @@ def _research_digest_opportunity(
     if has_actionable:
         facts.append(f"suggested action: {actionable}")
         evidence.append("category.digest.actionable")
+    # Opportunity #1 (scoring-lab finding): the digest item's own `summary` field carries the
+    # actual headline figure (e.g. "38% lower caries recurrence") that Case Study 1's own 50/50
+    # reference message leads with -- title alone never states it. Verbatim only, never
+    # paraphrased: this is real, curated source text, not something to condense or interpret.
+    # Inserted right after the title (facts[0]) and only if the full text still fits -- see
+    # _insert_summary_if_it_fits()'s own docstring for why.
+    _insert_summary_if_it_fits(facts, evidence, summary, 1)
 
     return Opportunity(
         name=f"research_digest:{item.get('id', '')}",
@@ -1266,6 +1325,8 @@ def _regulation_change_opportunity(
     urgency_factor = 1.0 + _URGENCY_FACTOR_PER_LEVEL * (trigger.urgency - _URGENCY_BASELINE)
     score = _clamp((raw / 2.6) * urgency_factor)
 
+    summary = item.get("summary")
+
     facts = [title, f"deadline: {deadline_iso}"]
     evidence = [
         "trigger.payload.category",
@@ -1281,6 +1342,11 @@ def _regulation_change_opportunity(
     if has_actionable:
         facts.append(f"suggested action: {actionable}")
         evidence.append("category.digest.actionable")
+    # Opportunity #1: the digest item's own `summary` carries the real specific figures (e.g.
+    # "1.5 mSv to 1.0 mSv") the title alone doesn't state -- verbatim only, never paraphrased.
+    # Inserted right after the title (facts[0]) and only if it still fits -- see
+    # _insert_summary_if_it_fits()'s docstring.
+    _insert_summary_if_it_fits(facts, evidence, summary, 1)
 
     return Opportunity(
         name=f"regulation_change:{item.get('id', '')}",
